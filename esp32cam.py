@@ -153,76 +153,81 @@ def recognize(embedding, database):
     return best_name, best_score
 
 
-print("Enrolling known faces dari folder referensi...")
-known_faces_db = enroll_known_faces()
-print(f"Total {len(known_faces_db)} embedding wajah ter-enroll dari {len(set(n for n, _ in known_faces_db))} orang.\n")
+def main():
+    print("Enrolling known faces dari folder referensi...")
+    known_faces_db = enroll_known_faces()
+    print(f"Total {len(known_faces_db)} embedding wajah ter-enroll dari {len(set(n for n, _ in known_faces_db))} orang.\n")
 
-print("Mulai menarik gambar dari ESP32-CAM...")
-print("Tekan 'q' pada jendela tampilan (GUI) ATAU di terminal untuk keluar.")
+    print("Mulai menarik gambar dari ESP32-CAM...")
+    print("Tekan 'q' pada jendela tampilan (GUI) ATAU di terminal untuk keluar.")
 
-while True:
-    try:
-        if sys.platform == 'win32' and msvcrt.kbhit():
-            if msvcrt.getch().lower() == b'q':
-                print("\nTombol 'q' ditekan di terminal. Menutup program...")
+    while True:
+        try:
+            if sys.platform == 'win32' and msvcrt.kbhit():
+                if msvcrt.getch().lower() == b'q':
+                    print("\nTombol 'q' ditekan di terminal. Menutup program...")
+                    break
+
+            # 1. Menarik gambar satu per satu dari endpoint /capture (dengan timeout 3 detik)
+            with urllib.request.urlopen(url, timeout=3) as img_resp:
+                imgnp = np.array(bytearray(img_resp.read()), dtype=np.uint8)
+
+            # 2. Decode data array menjadi frame gambar (format OpenCV)
+            frame = cv2.imdecode(imgnp, -1)
+            if frame is None:
+                continue
+
+            # 3. Sesuaikan input_size detector dengan ukuran frame yang diterima
+            h, w, _ = frame.shape
+            face_detector.setInputSize((w, h))
+
+            # 4. Proses Face Detection menggunakan YuNet
+            _, faces = face_detector.detect(frame)
+
+            # 5. Untuk tiap wajah terdeteksi: recognize lalu gambar kotak + label
+            if faces is not None:
+                for face in faces:
+                    x, y, fw, fh = map(int, face[:4])
+                    x, y = max(0, x), max(0, y)
+                    fw, fh = min(fw, w - x), min(fh, h - y)
+
+                    # --- FACE RECOGNITION ---
+                    embedding = get_embedding(frame, face)
+                    name, score = recognize(embedding, known_faces_db)
+
+                    color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                    cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
+
+                    label = f"{name} ({score:.2f})"
+                    cv2.putText(frame, label, (x, max(0, y - 10)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # 6. Tampilkan hasil pemrosesan di jendela komputer
+            cv2.imshow("ESP32-CAM Face Recognition", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            terminal_pressed_q = (sys.platform == 'win32' and msvcrt.kbhit() and msvcrt.getch().lower() == b'q')
+
+            if key == ord('q') or terminal_pressed_q:
+                print("\nKeluar dari program...")
                 break
 
-        # 1. Menarik gambar satu per satu dari endpoint /capture (dengan timeout 3 detik)
-        with urllib.request.urlopen(url, timeout=3) as img_resp:
-            imgnp = np.array(bytearray(img_resp.read()), dtype=np.uint8)
-
-        # 2. Decode data array menjadi frame gambar (format OpenCV)
-        frame = cv2.imdecode(imgnp, -1)
-        if frame is None:
+        except KeyboardInterrupt:
+            print("\nProgram dihentikan oleh pengguna (Ctrl+C).")
+            break
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"Gagal mengambil gambar dari ESP32-CAM ({e}). Mencoba lagi...")
+            if sys.platform == 'win32' and msvcrt.kbhit():
+                if msvcrt.getch().lower() == b'q':
+                    print("\nTombol 'q' ditekan di terminal. Menutup program...")
+                    break
             continue
-
-        # 3. Sesuaikan input_size detector dengan ukuran frame yang diterima
-        h, w, _ = frame.shape
-        face_detector.setInputSize((w, h))
-
-        # 4. Proses Face Detection menggunakan YuNet
-        _, faces = face_detector.detect(frame)
-
-        # 5. Untuk tiap wajah terdeteksi: recognize lalu gambar kotak + label
-        if faces is not None:
-            for face in faces:
-                x, y, fw, fh = map(int, face[:4])
-                x, y = max(0, x), max(0, y)
-                fw, fh = min(fw, w - x), min(fh, h - y)
-
-                # --- FACE RECOGNITION ---
-                embedding = get_embedding(frame, face)
-                name, score = recognize(embedding, known_faces_db)
-
-                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
-                cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
-
-                label = f"{name} ({score:.2f})"
-                cv2.putText(frame, label, (x, max(0, y - 10)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-        # 6. Tampilkan hasil pemrosesan di jendela komputer
-        cv2.imshow("ESP32-CAM Face Recognition", frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        terminal_pressed_q = (sys.platform == 'win32' and msvcrt.kbhit() and msvcrt.getch().lower() == b'q')
-
-        if key == ord('q') or terminal_pressed_q:
-            print("\nKeluar dari program...")
+        except Exception as e:
+            print(f"Terjadi kesalahan: {e}")
             break
 
-    except KeyboardInterrupt:
-        print("\nProgram dihentikan oleh pengguna (Ctrl+C).")
-        break
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"Gagal mengambil gambar dari ESP32-CAM ({e}). Mencoba lagi...")
-        if sys.platform == 'win32' and msvcrt.kbhit():
-            if msvcrt.getch().lower() == b'q':
-                print("\nTombol 'q' ditekan di terminal. Menutup program...")
-                break
-        continue
-    except Exception as e:
-        print(f"Terjadi kesalahan: {e}")
-        break
+    cv2.destroyAllWindows()
 
-cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()
