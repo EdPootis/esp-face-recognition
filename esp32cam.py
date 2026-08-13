@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 import cv2
 import urllib.request
 import urllib.error
@@ -11,19 +12,31 @@ if sys.platform == 'win32':
 # Ganti dengan IP Address ESP32-CAM Anda yang sesuai
 url = 'http://10.17.13.130/capture'
 
-# Path dan URL model Face Detection YuNet (OpenCV 5 DNN)
-model_path = 'face_detection_yunet_2023mar.onnx'
-model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx'
+# Folder berisi foto referensi, struktur: known_faces/<nama>/foto1.jpg, foto2.jpg, ...
+KNOWN_FACES_DIR = 'known_faces'
+
+# Threshold cosine similarity resmi dari OpenCV (>= nilai ini dianggap orang yang sama)
+# Semakin tinggi = semakin ketat (lebih sedikit false-positive, tapi bisa nolak wajah asli)
+RECOGNITION_THRESHOLD = 0.363
+
+# --- Path dan URL model Face Detection (YuNet) ---
+detect_model_path = 'face_detection_yunet_2023mar.onnx'
+detect_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx'
+
+# --- Path dan URL model Face Recognition (SFace) ---
+recog_model_path = 'face_recognition_sface_2021dec.onnx'
+recog_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx'
 
 # Unduh model secara otomatis jika belum ada di direktori
-if not os.path.exists(model_path):
-    print("Mengunduh model face detection YuNet...")
-    urllib.request.urlretrieve(model_url, model_path)
-    print("Model berhasil diunduh.")
+for path, dl_url in [(detect_model_path, detect_model_url), (recog_model_path, recog_model_url)]:
+    if not os.path.exists(path):
+        print(f"Mengunduh model {path}...")
+        urllib.request.urlretrieve(dl_url, path)
+        print("Model berhasil diunduh.")
 
-# Inisialisasi FaceDetectorYN (YuNet)
+# Inisialisasi FaceDetectorYN (deteksi wajah)
 face_detector = cv2.FaceDetectorYN_create(
-    model=model_path,
+    model=detect_model_path,
     config='',
     input_size=(320, 240),
     score_threshold=0.6,
@@ -31,12 +44,89 @@ face_detector = cv2.FaceDetectorYN_create(
     top_k=5000
 )
 
+# Inisialisasi FaceRecognizerSF (pengenalan wajah)
+recognizer = cv2.FaceRecognizerSF_create(model=recog_model_path, config='')
+
+
+def get_embedding(image, face_row):
+    """Align + crop wajah dari 1 baris hasil deteksi YuNet, lalu ekstrak embedding-nya."""
+    aligned_face = recognizer.alignCrop(image, face_row)
+    return recognizer.feature(aligned_face)
+
+
+def enroll_known_faces():
+    """
+    Baca semua foto di known_faces/<nama>/*.jpg|png, deteksi wajahnya,
+    lalu simpan embedding-nya ke database (list of (nama, embedding)).
+    """
+    database = []
+
+    if not os.path.isdir(KNOWN_FACES_DIR):
+        print(f"Folder '{KNOWN_FACES_DIR}' belum ada, dibuat otomatis. "
+              f"Isi dengan subfolder per orang (mis. known_faces/Budi/foto1.jpg).")
+        os.makedirs(KNOWN_FACES_DIR, exist_ok=True)
+        return database
+
+    for person_name in sorted(os.listdir(KNOWN_FACES_DIR)):
+        person_dir = os.path.join(KNOWN_FACES_DIR, person_name)
+        if not os.path.isdir(person_dir):
+            continue
+
+        photo_paths = glob.glob(os.path.join(person_dir, '*.jpg')) + \
+                      glob.glob(os.path.join(person_dir, '*.jpeg')) + \
+                      glob.glob(os.path.join(person_dir, '*.png'))
+
+        count = 0
+        for photo_path in photo_paths:
+            img = cv2.imread(photo_path)
+            if img is None:
+                print(f"  [!] Gagal baca {photo_path}, dilewati.")
+                continue
+
+            h, w, _ = img.shape
+            face_detector.setInputSize((w, h))
+            _, faces = face_detector.detect(img)
+
+            if faces is None or len(faces) == 0:
+                print(f"  [!] Tidak ada wajah terdeteksi di {photo_path}, dilewati.")
+                continue
+
+            # Ambil wajah dengan confidence tertinggi kalau ada lebih dari satu
+            best_face = max(faces, key=lambda f: f[-1])
+            embedding = get_embedding(img, best_face)
+            database.append((person_name, embedding))
+            count += 1
+
+        print(f"  Enrolled '{person_name}': {count} foto berhasil diproses dari {len(photo_paths)} foto.")
+
+    return database
+
+
+def recognize(embedding, database):
+    """Bandingkan 1 embedding wajah ke seluruh database, kembalikan (nama, skor) terbaik."""
+    best_name = "Unknown"
+    best_score = -1.0
+
+    for name, known_embedding in database:
+        score = recognizer.match(embedding, known_embedding, cv2.FaceRecognizerSF_FR_COSINE)
+        if score > best_score:
+            best_score = score
+            best_name = name
+
+    if best_score < RECOGNITION_THRESHOLD:
+        return "Unknown", best_score
+    return best_name, best_score
+
+
+print("Enrolling known faces dari folder referensi...")
+known_faces_db = enroll_known_faces()
+print(f"Total {len(known_faces_db)} embedding wajah ter-enroll dari {len(set(n for n, _ in known_faces_db))} orang.\n")
+
 print("Mulai menarik gambar dari ESP32-CAM...")
 print("Tekan 'q' pada jendela tampilan (GUI) ATAU di terminal untuk keluar.")
 
 while True:
     try:
-        # Cek apakah ada input 'q' dari terminal sebelum request
         if sys.platform == 'win32' and msvcrt.kbhit():
             if msvcrt.getch().lower() == b'q':
                 print("\nTombol 'q' ditekan di terminal. Menutup program...")
@@ -44,47 +134,44 @@ while True:
 
         # 1. Menarik gambar satu per satu dari endpoint /capture (dengan timeout 3 detik)
         with urllib.request.urlopen(url, timeout=3) as img_resp:
-            # 2. Mengonversi data biner menjadi array NumPy
             imgnp = np.array(bytearray(img_resp.read()), dtype=np.uint8)
 
-        # 3. Decode data array menjadi frame gambar (format OpenCV)
+        # 2. Decode data array menjadi frame gambar (format OpenCV)
         frame = cv2.imdecode(imgnp, -1)
         if frame is None:
             continue
 
-        # 4. Sesuaikan input_size detector dengan ukuran frame yang diterima
+        # 3. Sesuaikan input_size detector dengan ukuran frame yang diterima
         h, w, _ = frame.shape
         face_detector.setInputSize((w, h))
 
-        # 5. Proses Face Detection menggunakan YuNet
+        # 4. Proses Face Detection menggunakan YuNet
         _, faces = face_detector.detect(frame)
 
-        # 6. Gambar kotak di sekitar wajah yang terdeteksi
+        # 5. Untuk tiap wajah terdeteksi: recognize lalu gambar kotak + label
         if faces is not None:
             for face in faces:
                 x, y, fw, fh = map(int, face[:4])
-                
-                # Pastikan koordinat berada di dalam batas frame
                 x, y = max(0, x), max(0, y)
                 fw, fh = min(fw, w - x), min(fh, h - y)
 
-                cv2.rectangle(frame, (x, y), (x + fw, y + fh), (0, 255, 0), 2)
+                # --- FACE RECOGNITION ---
+                embedding = get_embedding(frame, face)
+                name, score = recognize(embedding, known_faces_db)
 
-                # Ekstraksi Region of Interest (ROI) wajah untuk tahap Recognition
-                face_roi = frame[y:y+fh, x:x+fw]
+                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
 
-                # --- LOGIKA FACE RECOGNITION MASUK DI SINI ---
-                # Contoh pemanggilan: 
-                # identity = my_recognition_model.predict(face_roi)
-                # cv2.putText(frame, identity, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                label = f"{name} ({score:.2f})"
+                cv2.putText(frame, label, (x, max(0, y - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-        # 7. Tampilkan hasil pemrosesan di jendela komputer
-        cv2.imshow("ESP32-CAM External Processing", frame)
+        # 6. Tampilkan hasil pemrosesan di jendela komputer
+        cv2.imshow("ESP32-CAM Face Recognition", frame)
 
-        # Keluar jika tombol 'q' ditekan di jendela OpenCV atau di terminal
         key = cv2.waitKey(1) & 0xFF
         terminal_pressed_q = (sys.platform == 'win32' and msvcrt.kbhit() and msvcrt.getch().lower() == b'q')
-        
+
         if key == ord('q') or terminal_pressed_q:
             print("\nKeluar dari program...")
             break
@@ -94,7 +181,6 @@ while True:
         break
     except (urllib.error.URLError, TimeoutError) as e:
         print(f"Gagal mengambil gambar dari ESP32-CAM ({e}). Mencoba lagi...")
-        # Periksa input 'q' dari terminal saat gagal koneksi
         if sys.platform == 'win32' and msvcrt.kbhit():
             if msvcrt.getch().lower() == b'q':
                 print("\nTombol 'q' ditekan di terminal. Menutup program...")
@@ -104,6 +190,4 @@ while True:
         print(f"Terjadi kesalahan: {e}")
         break
 
-# Bersihkan resource saat selesai
 cv2.destroyAllWindows()
-
