@@ -5,6 +5,7 @@ import cv2
 import urllib.request
 import urllib.error
 import numpy as np
+from PIL import Image, ImageOps
 
 if sys.platform == 'win32':
     import msvcrt
@@ -38,14 +39,45 @@ for path, dl_url in [(detect_model_path, detect_model_url), (recog_model_path, r
 face_detector = cv2.FaceDetectorYN_create(
     model=detect_model_path,
     config='',
-    input_size=(320, 240),
+    input_size=(800, 600),
     score_threshold=0.6,
+    nms_threshold=0.3,
+    top_k=5000
+)
+
+# Detector khusus untuk enrollment: threshold lebih longgar karena foto referensi
+# biasanya sudah bersih/terkontrol (bukan live feed dengan background ramai),
+# jadi aman untuk lebih permisif supaya foto dengan angle sedikit ekstrem tetap kedeteksi.
+enroll_detector = cv2.FaceDetectorYN_create(
+    model=detect_model_path,
+    config='',
+    input_size=(800, 600),
+    score_threshold=0.3,
     nms_threshold=0.3,
     top_k=5000
 )
 
 # Inisialisasi FaceRecognizerSF (pengenalan wajah)
 recognizer = cv2.FaceRecognizerSF_create(model=recog_model_path, config='')
+
+
+def load_image_correct_orientation(path, max_dim=800):
+    """
+    Baca gambar dengan koreksi EXIF orientation dan resize ke resolusi optimal (max_dim=800px)
+    agar deteksi landmark YuNet presisi dan tidak menghasilkan crop wajah yang terdistorsi.
+    """
+    pil_img = Image.open(path)
+    pil_img = ImageOps.exif_transpose(pil_img)  # otomatis putar sesuai EXIF
+    pil_img = pil_img.convert('RGB')
+    img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+    # Resize gambar besar agar receptive field YuNet presisi membaca landmark wajah
+    h, w = img.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+
+    return img
 
 
 def get_embedding(image, face_row):
@@ -78,24 +110,27 @@ def enroll_known_faces():
 
         count = 0
         for photo_path in photo_paths:
-            img = cv2.imread(photo_path)
-            if img is None:
-                print(f"  [!] Gagal baca {photo_path}, dilewati.")
+            try:
+                img = load_image_correct_orientation(photo_path, max_dim=800)
+            except Exception as e:
+                print(f"  [!] Gagal baca {photo_path} ({e}), dilewati.")
                 continue
 
             h, w, _ = img.shape
-            face_detector.setInputSize((w, h))
-            _, faces = face_detector.detect(img)
+            enroll_detector.setInputSize((w, h))
+            _, faces = enroll_detector.detect(img)
 
             if faces is None or len(faces) == 0:
-                print(f"  [!] Tidak ada wajah terdeteksi di {photo_path}, dilewati.")
+                print(f"  [!] {os.path.basename(photo_path)}: TIDAK ADA wajah terdeteksi.")
                 continue
 
             # Ambil wajah dengan confidence tertinggi kalau ada lebih dari satu
             best_face = max(faces, key=lambda f: f[-1])
+            score = best_face[-1]
             embedding = get_embedding(img, best_face)
             database.append((person_name, embedding))
             count += 1
+            print(f"  [OK] {os.path.basename(photo_path)}: terdeteksi ({w}x{h}), confidence={score:.3f}")
 
         print(f"  Enrolled '{person_name}': {count} foto berhasil diproses dari {len(photo_paths)} foto.")
 
