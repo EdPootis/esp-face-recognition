@@ -3,6 +3,8 @@ import sys
 import glob
 import time
 import threading
+import urllib.parse
+from datetime import datetime
 import cv2
 import urllib.request
 import urllib.error
@@ -20,7 +22,7 @@ if sys.platform == 'win32':
 CAMERAS = {
     'ESP32-CAM 1': 'http://172.16.108.130/capture',
     'ESP32-CAM 2': 'http://172.16.108.31/capture',
-    # 'ESP32-CAM 3 (Ruang Tamu)': 'http://10.17.13.132/capture',
+    'ESP32-S3': 'http://172.16.108.60/capture',
 }
 
 # Folder berisi foto referensi wajah
@@ -212,10 +214,40 @@ def recognize(embedding, database):
     return best_name, best_score
 
 
+# Dictionary untuk tracking waktu & nama terakhir dikirim per kamera
+_cam_last_notif = {}
+
+
+def send_face_to_esp32_async(cam_url, name, score, cam_name):
+    """Kirim hasil deteksi (waktu, nama, kamera, skor) ke ESP32-CAM secara async."""
+    def _worker():
+        try:
+            # cam_url misal 'http://172.16.108.31/capture' -> base_url 'http://172.16.108.31'
+            base_url = cam_url.split('/capture')[0].rstrip('/')
+            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            encoded_name = urllib.parse.quote(name)
+            encoded_cam = urllib.parse.quote(cam_name)
+            encoded_time = urllib.parse.quote(time_str)
+
+            target_url = (f"{base_url}/face?"
+                          f"name={encoded_name}&"
+                          f"score={score:.2f}&"
+                          f"cam={encoded_cam}&"
+                          f"time={encoded_time}")
+
+            req = urllib.request.Request(target_url, headers={'User-Agent': 'FaceRecClient'})
+            with urllib.request.urlopen(req, timeout=1.5) as _:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 # ==============================================================================
 # PEMROSESAN & TAMPILAN GRID
 # ==============================================================================
-def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
+def process_camera_frame(raw_frame, cam_name, cam_url, connected, fps, known_faces_db):
     """
     Menjalankan face detection & recognition pada frame,
     lalu menambahkan overlay nama kamera, status koneksi, dan bounding box.
@@ -240,7 +272,8 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
     scale_x = TILE_WIDTH / w
     scale_y = TILE_HEIGHT / h
 
-    if faces is not None:
+    if faces is not None and len(faces) > 0:
+        global _cam_last_notif
         for face in faces:
             fx, fy, fw, fh = map(int, face[:4])
             fx, fy = max(0, fx), max(0, fy)
@@ -249,6 +282,13 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
             # Ekstrak embedding dan kenali wajah
             embedding = get_embedding(raw_frame, face)
             name, score = recognize(embedding, known_faces_db)
+
+            # Kirim notifikasi ke Serial Monitor ESP32-CAM (cooldown 1.5 detik per kamera)
+            now = time.time()
+            last_name, last_time = _cam_last_notif.get(cam_name, ("", 0))
+            if (now - last_time > 1.5) or (name != last_name):
+                send_face_to_esp32_async(cam_url, name, score, cam_name)
+                _cam_last_notif[cam_name] = (name, now)
 
             # Hitung koordinat skala untuk visualisasi pada tile
             dx = int(fx * scale_x)
@@ -345,7 +385,7 @@ def main():
             tiles = []
             for streamer in streamers:
                 raw_frame, connected, fps = streamer.get_latest_frame()
-                tile = process_camera_frame(raw_frame, streamer.cam_name, connected, fps, known_faces_db)
+                tile = process_camera_frame(raw_frame, streamer.cam_name, streamer.url, connected, fps, known_faces_db)
                 tiles.append(tile)
 
             # 4. Gabungkan ke dalam 1 tampilan Grid

@@ -1,6 +1,10 @@
 import os
 import sys
 import glob
+import time
+import threading
+import urllib.parse
+from datetime import datetime
 import cv2
 import urllib.request
 import urllib.error
@@ -12,8 +16,11 @@ if sys.platform == 'win32':
 
 
 # Ganti dengan IP Address ESP32-CAM Anda yang sesuai
-#IP_ADDRESS = ['172.16.108.130', '172.16.108.31']
+#IP_ADDRESS = ['172.16.108.130', '172.16.108.31', '172.16.108.60']
 IP_ADDRESS = '172.16.108.31'
+
+# Nama/Label Kamera
+CAMERA_NAME = f"ESP32-CAM ({IP_ADDRESS})"
 
 url = f'http://{IP_ADDRESS}/capture'
 
@@ -23,6 +30,34 @@ KNOWN_FACES_DIR = 'known_faces'
 # Threshold cosine similarity resmi dari OpenCV (>= nilai ini dianggap orang yang sama)
 # Semakin tinggi = semakin ketat (lebih sedikit false-positive, tapi bisa nolak wajah asli)
 RECOGNITION_THRESHOLD = 0.363
+
+# Waktu & nama terakhir dikirim ke ESP32 (agar tidak spamming Serial Monitor)
+_last_sent_name = ""
+_last_sent_time = 0
+
+
+def send_face_to_esp32_async(ip_address, name, score, cam_name=CAMERA_NAME):
+    """Kirim hasil deteksi (waktu, nama, kamera, skor) ke ESP32-CAM secara async."""
+    def _worker():
+        try:
+            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            encoded_name = urllib.parse.quote(name)
+            encoded_cam = urllib.parse.quote(cam_name)
+            encoded_time = urllib.parse.quote(time_str)
+
+            target_url = (f"http://{ip_address}/face?"
+                          f"name={encoded_name}&"
+                          f"score={score:.2f}&"
+                          f"cam={encoded_cam}&"
+                          f"time={encoded_time}")
+
+            req = urllib.request.Request(target_url, headers={'User-Agent': 'FaceRecClient'})
+            with urllib.request.urlopen(req, timeout=1.5) as _:
+                pass
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 # --- Path dan URL model Face Detection (YuNet) ---
 detect_model_path = 'face_detection_yunet_2023mar.onnx'
@@ -189,7 +224,8 @@ def main():
             _, faces = face_detector.detect(frame)
 
             # 5. Untuk tiap wajah terdeteksi: recognize lalu gambar kotak + label
-            if faces is not None:
+            if faces is not None and len(faces) > 0:
+                global _last_sent_name, _last_sent_time
                 for face in faces:
                     x, y, fw, fh = map(int, face[:4])
                     x, y = max(0, x), max(0, y)
@@ -198,6 +234,13 @@ def main():
                     # --- FACE RECOGNITION ---
                     embedding = get_embedding(frame, face)
                     name, score = recognize(embedding, known_faces_db)
+
+                    # Kirim notifikasi ke Serial Monitor ESP32-CAM (cooldown 1.5 detik atau jika nama berganti)
+                    now = time.time()
+                    if (now - _last_sent_time > 1.5) or (name != _last_sent_name):
+                        send_face_to_esp32_async(IP_ADDRESS, name, score)
+                        _last_sent_name = name
+                        _last_sent_time = now
 
                     color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
                     cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
