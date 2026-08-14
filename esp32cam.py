@@ -10,8 +10,12 @@ from PIL import Image, ImageOps
 if sys.platform == 'win32':
     import msvcrt
 
+
 # Ganti dengan IP Address ESP32-CAM Anda yang sesuai
-url = 'http://10.17.13.130/capture'
+#IP_ADDRESS = ['172.16.108.130', '172.16.108.31']
+IP_ADDRESS = '172.16.108.31'
+
+url = f'http://{IP_ADDRESS}/capture'
 
 # Folder berisi foto referensi, struktur: known_faces/<nama>/foto1.jpg, foto2.jpg, ...
 KNOWN_FACES_DIR = 'known_faces'
@@ -230,4 +234,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main()
