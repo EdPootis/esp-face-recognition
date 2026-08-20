@@ -3,6 +3,8 @@ import sys
 import glob
 import time
 import threading
+import json
+import base64
 import urllib.parse
 from datetime import datetime
 import cv2
@@ -28,8 +30,13 @@ url = f'http://{IP_ADDRESS}/capture'
 KNOWN_FACES_DIR = 'known_faces'
 
 # Threshold cosine similarity resmi dari OpenCV (>= nilai ini dianggap orang yang sama)
-# Semakin tinggi = semakin ketat (lebih sedikit false-positive, tapi bisa nolak wajah asli)
 RECOGNITION_THRESHOLD = 0.363
+
+# Konfigurasi Dashboard Django (Log Absensi)
+DASHBOARD_URL = 'http://127.0.0.1:8000/api/receive-log/'
+ENABLE_DASHBOARD = True
+DASHBOARD_COOLDOWN_RECOGNIZED = 5.0  # Jeda pengiriman log wajah teridentifikasi (detik) per orang
+DASHBOARD_COOLDOWN_UNKNOWN = 3.0     # Jeda pengiriman log wajah unknown (detik)
 
 # Waktu & nama terakhir dikirim ke ESP32 (agar tidak spamming Serial Monitor)
 _last_sent_name = ""
@@ -56,6 +63,68 @@ def send_face_to_esp32_async(ip_address, name, score, cam_name=CAMERA_NAME):
                 pass
         except Exception:
             pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# Dictionary untuk tracking waktu log dikirim ke dashboard
+_dashboard_last_sent = {}
+
+
+def crop_face_roi(image, face_row, margin=0.2):
+    """Crop area wajah dari image berdasarkan koordinat deteksi YuNet dengan margin tambahan."""
+    h, w = image.shape[:2]
+    fx, fy, fw, fh = map(int, face_row[:4])
+
+    margin_w = int(fw * margin)
+    margin_h = int(fh * margin)
+
+    x1 = max(0, fx - margin_w)
+    y1 = max(0, fy - margin_h)
+    x2 = min(w, fx + fw + margin_w)
+    y2 = min(h, fy + fh + margin_h)
+
+    return image[y1:y2, x1:x2]
+
+
+def encode_image_to_b64(crop_img, quality=85):
+    """Encode OpenCV image/crop ke string Base64 format data URI JPEG."""
+    if crop_img is None or crop_img.size == 0:
+        return None
+    success, buffer = cv2.imencode('.jpg', crop_img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not success:
+        return None
+    b64_str = base64.b64encode(buffer).decode('utf-8')
+    return f"data:image/jpeg;base64,{b64_str}"
+
+
+def send_log_to_dashboard_async(dashboard_url, cam_name, name, score, face_status, face_crop):
+    """Kirim log absensi ke Dashboard Django (receive_log API) secara async."""
+    def _worker():
+        try:
+            foto_b64 = encode_image_to_b64(face_crop)
+            payload = {
+                'nama': name,
+                'kamera': cam_name,
+                'skor': round(float(score), 4),
+                'status': face_status,
+                'foto_b64': foto_b64
+            }
+            data_bytes = json.dumps(payload).encode('utf-8')
+            req = urllib.request.Request(
+                dashboard_url,
+                data=data_bytes,
+                headers={
+                    'Content-Type': 'application/json',
+                    'User-Agent': 'FaceRecClient'
+                },
+                method='POST'
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                status_code = resp.getcode()
+                print(f"[DASHBOARD] Log terkirim ({status_code}) -> Kamera: {cam_name} | Nama: {name} | Status: {face_status} | Skor: {score:.2f}")
+        except Exception as e:
+            print(f"[DASHBOARD ERROR] Gagal mengirim log ({cam_name} / {name}): {e}")
 
     threading.Thread(target=_worker, daemon=True).start()
 
@@ -241,6 +310,19 @@ def main():
                         send_face_to_esp32_async(IP_ADDRESS, name, score)
                         _last_sent_name = name
                         _last_sent_time = now
+
+                    # Kirim log absensi ke Dashboard Django (wajah recognized & unrecognized)
+                    if ENABLE_DASHBOARD:
+                        global _dashboard_last_sent
+                        face_status = "recognized" if name != "Unknown" else "unrecognized"
+                        cooldown = DASHBOARD_COOLDOWN_RECOGNIZED if face_status == "recognized" else DASHBOARD_COOLDOWN_UNKNOWN
+                        dash_key = (CAMERA_NAME, name if face_status == "recognized" else "Unknown")
+                        last_dash_time = _dashboard_last_sent.get(dash_key, 0)
+
+                        if now - last_dash_time > cooldown:
+                            face_crop = crop_face_roi(frame, face)
+                            send_log_to_dashboard_async(DASHBOARD_URL, CAMERA_NAME, name, score, face_status, face_crop)
+                            _dashboard_last_sent[dash_key] = now
 
                     color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
                     cv2.rectangle(frame, (x, y), (x + fw, y + fh), color, 2)
