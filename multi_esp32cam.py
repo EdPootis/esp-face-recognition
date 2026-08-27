@@ -10,6 +10,7 @@ from datetime import datetime
 import cv2
 import urllib.request
 import urllib.error
+import http.client
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -22,9 +23,9 @@ if sys.platform == 'win32':
 
 # Daftar IP Address ESP32-CAM (Bisa ditambahkan sesuai kebutuhan)
 CAMERAS = {
-    'ESP32-CAM 1': 'http://10.67.46.130/capture',
-    'ESP32-CAM 2': 'http://10.67.46.31/capture',
-    'ESP32-S3': 'http://10.67.46.60/capture',
+    'ESP32-CAM 1': 'http://10.244.226.130/capture',
+    'ESP32-CAM 2': 'http://10.244.226.31/capture',
+    'ESP32-S3': 'http://10.90.235.60/capture',
 }
 
 # Folder berisi foto referensi wajah
@@ -34,7 +35,7 @@ KNOWN_FACES_DIR = 'known_faces'
 RECOGNITION_THRESHOLD = 0.363
 
 # Konfigurasi Dashboard Django (Log Absensi)
-DASHBOARD_URL = 'http://10.67.46.241:8000/api/receive-log/'
+DASHBOARD_URL = 'http://10.67.46.241:8000/api/log/'
 ENABLE_DASHBOARD = True
 DASHBOARD_COOLDOWN_RECOGNIZED = 5.0  # Jeda pengiriman log wajah teridentifikasi (detik) per orang & kamera
 DASHBOARD_COOLDOWN_UNKNOWN = 3.0     # Jeda pengiriman log wajah unknown (detik) per kamera
@@ -85,10 +86,10 @@ recognizer = cv2.FaceRecognizerSF_create(model=recog_model_path, config='')
 class CameraStreamer(threading.Thread):
     """
     Thread independen untuk tiap ESP32-CAM.
-    Mengambil frame terbaru secara non-blocking agar delay pada satu kamera
-    tidak mempengaruhi performa kamera lainnya.
+    Mengambil frame terbaru secara non-blocking dengan Persistent HTTP Connection (Keep-Alive)
+    agar tidak terjadi penumpukan socket / socket exhaustion di ESP32.
     """
-    def __init__(self, cam_name, url, timeout=2.5):
+    def __init__(self, cam_name, url, timeout=4.0):
         super().__init__(daemon=True)
         self.cam_name = cam_name
         self.url = url
@@ -101,13 +102,32 @@ class CameraStreamer(threading.Thread):
         self._frame_count = 0
         self._fps_timer = time.time()
 
+        # Parse URL untuk persistent HTTP Connection
+        parsed = urllib.parse.urlparse(self.url)
+        self.host = parsed.netloc
+        self.path = parsed.path if parsed.path else '/capture'
+        if parsed.query:
+            self.path += '?' + parsed.query
+        self.conn = None
+
+    def _get_connection(self):
+        if self.conn is None:
+            self.conn = http.client.HTTPConnection(self.host, timeout=self.timeout)
+        return self.conn
+
     def run(self):
         while self.running:
             try:
-                req = urllib.request.Request(self.url, headers={'User-Agent': 'ESP32CAM-Client'})
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                conn = self._get_connection()
+                conn.request('GET', self.path, headers={
+                    'User-Agent': 'ESP32CAM-Client',
+                    'Connection': 'keep-alive'
+                })
+                resp = conn.getresponse()
+
+                if resp.status == 200:
                     raw_data = resp.read()
-                    img_np = np.array(bytearray(raw_data), dtype=np.uint8)
+                    img_np = np.frombuffer(raw_data, dtype=np.uint8)
                     decoded = cv2.imdecode(img_np, -1)
 
                     if decoded is not None:
@@ -125,6 +145,10 @@ class CameraStreamer(threading.Thread):
                     else:
                         with self.lock:
                             self.connected = False
+                else:
+                    resp.read()  # Flush buffer jika respons bukan 200
+                    with self.lock:
+                        self.connected = False
 
                 # Jeda mikro agar tidak membebani core CPU secara berlebihan
                 time.sleep(0.005)
@@ -132,6 +156,12 @@ class CameraStreamer(threading.Thread):
             except Exception:
                 with self.lock:
                     self.connected = False
+                if self.conn:
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                    self.conn = None
                 # Jeda sebelum mencoba reconnect
                 time.sleep(0.5)
 
@@ -143,6 +173,11 @@ class CameraStreamer(threading.Thread):
 
     def stop(self):
         self.running = False
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
 
 # ==============================================================================
