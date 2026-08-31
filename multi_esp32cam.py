@@ -5,6 +5,7 @@ import time
 import threading
 import json
 import base64
+import argparse
 import urllib.parse
 from datetime import datetime
 import cv2
@@ -22,12 +23,26 @@ if sys.platform == 'win32':
 # ==============================================================================
 
 # Daftar IP Address ESP32-CAM (Bisa ditambahkan sesuai kebutuhan)
-# Catatan: Endpoint stream bawaan ESP32-CAM / ESP32-S3 berada pada port 81 (/stream)
-CAMERAS = {
-    'ESP32-CAM 1': 'http://10.244.226.130:81/stream',
-    'ESP32-CAM 2': 'http://10.244.226.31:81/stream',
-    'ESP32-S3': 'http://10.90.235.60:81/stream',
+CAMERA_HOSTS = {
+    'ESP32-CAM 1': '10.244.226.130',
+    'ESP32-CAM 2': '10.244.226.31',
+    'ESP32-S3': '10.90.235.60',
 }
+
+
+def get_camera_urls(mode='stream'):
+    """
+    Menghasilkan dictionary URL kamera berdasarkan mode yang dipilih:
+    - 'stream'  : http://<IP>:81/stream (MJPEG Continuous Stream)
+    - 'capture' : http://<IP>/capture (Snapshot Polling Keep-Alive)
+    """
+    cameras = {}
+    for name, host in CAMERA_HOSTS.items():
+        if mode == 'stream':
+            cameras[name] = f"http://{host}:81/stream"
+        else:
+            cameras[name] = f"http://{host}/capture"
+    return cameras
 
 # Folder berisi foto referensi wajah
 KNOWN_FACES_DIR = 'known_faces'
@@ -87,13 +102,15 @@ recognizer = cv2.FaceRecognizerSF_create(model=recog_model_path, config='')
 class CameraStreamer(threading.Thread):
     """
     Thread independen untuk tiap ESP32-CAM / ESP32-S3.
-    Mengambil frame terbaru dari endpoint /stream (MJPEG Continuous Stream) secara real-time
-    dengan penanganan buffer otomatis agar tidak terjadi delay/lag.
+    Mendukung 2 mode streaming:
+    1. 'stream'  : Membaca MJPEG stream (/stream pada port 81) dengan 0-lag buffer handling.
+    2. 'capture' : Membaca snapshot (/capture pada port 80) menggunakan Persistent HTTP Connection (Keep-Alive).
     """
-    def __init__(self, cam_name, url, timeout=5.0):
+    def __init__(self, cam_name, url, mode='stream', timeout=5.0):
         super().__init__(daemon=True)
         self.cam_name = cam_name
         self.url = url
+        self.mode = mode.lower()
         self.timeout = timeout
         self.frame = None
         self.lock = threading.Lock()
@@ -103,54 +120,114 @@ class CameraStreamer(threading.Thread):
         self._frame_count = 0
         self._fps_timer = time.time()
 
+        # Parse URL untuk mode capture (Persistent HTTP Connection)
+        parsed = urllib.parse.urlparse(self.url)
+        self.host = parsed.netloc
+        self.path = parsed.path if parsed.path else ('/stream' if self.mode == 'stream' else '/capture')
+        if parsed.query:
+            self.path += '?' + parsed.query
+        self.conn = None
+
+    def _get_connection(self):
+        if self.conn is None:
+            self.conn = http.client.HTTPConnection(self.host, timeout=self.timeout)
+        return self.conn
+
+    def _run_stream(self):
+        """Mode MJPEG Continuous Stream Reader"""
+        req = urllib.request.Request(self.url, headers={'User-Agent': 'ESP32CAM-Client'})
+        with urllib.request.urlopen(req, timeout=self.timeout) as stream:
+            bytes_buffer = b''
+            while self.running:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                bytes_buffer += chunk
+
+                # Cari marker awal (\xff\xd8) dan akhir (\xff\xd9) dari frame JPEG
+                a = bytes_buffer.find(b'\xff\xd8')
+                b = bytes_buffer.find(b'\xff\xd9')
+
+                if a != -1 and b != -1 and b > a:
+                    # Jika ada beberapa frame menumpuk di buffer, ambil frame TERBARU (terakhir) untuk 0-lag
+                    last_b = bytes_buffer.rfind(b'\xff\xd9')
+                    last_a = bytes_buffer.rfind(b'\xff\xd8', 0, last_b)
+
+                    if last_a != -1 and last_b != -1 and last_b > last_a:
+                        jpg_data = bytes_buffer[last_a:last_b + 2]
+                        bytes_buffer = bytes_buffer[last_b + 2:]
+                    else:
+                        jpg_data = bytes_buffer[a:b + 2]
+                        bytes_buffer = bytes_buffer[b + 2:]
+
+                    decoded = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+                    if decoded is not None:
+                        with self.lock:
+                            self.frame = decoded
+                            self.connected = True
+                        self._frame_count += 1
+
+                        now = time.time()
+                        if now - self._fps_timer >= 1.0:
+                            self.fps = self._frame_count / (now - self._fps_timer)
+                            self._frame_count = 0
+                            self._fps_timer = now
+                    else:
+                        with self.lock:
+                            self.connected = False
+
+    def _run_capture(self):
+        """Mode Snapshot (/capture) dengan Persistent HTTP Keep-Alive"""
+        conn = self._get_connection()
+        conn.request('GET', self.path, headers={
+            'User-Agent': 'ESP32CAM-Client',
+            'Connection': 'keep-alive'
+        })
+        resp = conn.getresponse()
+
+        if resp.status == 200:
+            raw_data = resp.read()
+            img_np = np.frombuffer(raw_data, dtype=np.uint8)
+            decoded = cv2.imdecode(img_np, -1)
+
+            if decoded is not None:
+                with self.lock:
+                    self.frame = decoded
+                    self.connected = True
+                self._frame_count += 1
+
+                now = time.time()
+                if now - self._fps_timer >= 1.0:
+                    self.fps = self._frame_count / (now - self._fps_timer)
+                    self._frame_count = 0
+                    self._fps_timer = now
+            else:
+                with self.lock:
+                    self.connected = False
+        else:
+            resp.read()  # Flush respons jika non-200
+            with self.lock:
+                self.connected = False
+
+        time.sleep(0.005)
+
     def run(self):
         while self.running:
             try:
-                req = urllib.request.Request(self.url, headers={'User-Agent': 'ESP32CAM-Client'})
-                with urllib.request.urlopen(req, timeout=self.timeout) as stream:
-                    bytes_buffer = b''
-                    while self.running:
-                        chunk = stream.read(8192)
-                        if not chunk:
-                            break
-                        bytes_buffer += chunk
-
-                        # Cari marker awal (\xff\xd8) dan akhir (\xff\xd9) dari frame JPEG
-                        a = bytes_buffer.find(b'\xff\xd8')
-                        b = bytes_buffer.find(b'\xff\xd9')
-
-                        if a != -1 and b != -1 and b > a:
-                            # Jika ada beberapa frame menumpuk di buffer, ambil frame TERBARU (terakhir) untuk 0-lag
-                            last_b = bytes_buffer.rfind(b'\xff\xd9')
-                            last_a = bytes_buffer.rfind(b'\xff\xd8', 0, last_b)
-
-                            if last_a != -1 and last_b != -1 and last_b > last_a:
-                                jpg_data = bytes_buffer[last_a:last_b + 2]
-                                bytes_buffer = bytes_buffer[last_b + 2:]
-                            else:
-                                jpg_data = bytes_buffer[a:b + 2]
-                                bytes_buffer = bytes_buffer[b + 2:]
-
-                            decoded = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-
-                            if decoded is not None:
-                                with self.lock:
-                                    self.frame = decoded
-                                    self.connected = True
-                                self._frame_count += 1
-
-                                now = time.time()
-                                if now - self._fps_timer >= 1.0:
-                                    self.fps = self._frame_count / (now - self._fps_timer)
-                                    self._frame_count = 0
-                                    self._fps_timer = now
-                            else:
-                                with self.lock:
-                                    self.connected = False
-
+                if self.mode == 'stream':
+                    self._run_stream()
+                else:
+                    self._run_capture()
             except Exception:
                 with self.lock:
                     self.connected = False
+                if self.conn:
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                    self.conn = None
                 time.sleep(0.5)
 
     def get_latest_frame(self):
@@ -161,6 +238,11 @@ class CameraStreamer(threading.Thread):
 
     def stop(self):
         self.running = False
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
 
 # ==============================================================================
@@ -248,8 +330,11 @@ def send_face_to_esp32_async(cam_url, name, score, cam_name):
     """Kirim hasil deteksi (waktu, nama, kamera, skor) ke ESP32-CAM secara async."""
     def _worker():
         try:
-            # cam_url misal 'http://172.16.108.31/capture' -> base_url 'http://172.16.108.31'
-            base_url = cam_url.split('/capture')[0].rstrip('/')
+            parsed = urllib.parse.urlparse(cam_url)
+            host = parsed.hostname or parsed.netloc.split(':')[0]
+            scheme = parsed.scheme or 'http'
+            base_url = f"{scheme}://{host}"  # Target port 80 untuk endpoint /face
+
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             encoded_name = urllib.parse.quote(name)
             encoded_cam = urllib.parse.quote(cam_name)
@@ -446,12 +531,40 @@ def create_grid_display(tiles):
     return np.vstack(grid_rows)
 
 
+def parse_args():
+    """Mengurai argumen command line saat menjalankan skrip."""
+    parser = argparse.ArgumentParser(
+        description="ESP32-CAM Multi-Stream Face Recognition System",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        'mode_pos',
+        nargs='?',
+        choices=['stream', 'capture', 's', 'c'],
+        default=None,
+        help="Mode endpoint kamera:\n  'stream'  : Menggunakan MJPEG stream (port 81 /stream)\n  'capture' : Menggunakan snapshot polling Keep-Alive (port 80 /capture)\n  (Default: stream)"
+    )
+    parser.add_argument(
+        '-m', '--mode',
+        choices=['stream', 'capture', 's', 'c'],
+        default=None,
+        dest='mode_opt',
+        help="Mode endpoint kamera: 'stream' atau 'capture' (Default: stream)"
+    )
+    return parser.parse_args()
+
+
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
 def main():
+    args = parse_args()
+    raw_mode = args.mode_opt or args.mode_pos or 'stream'
+    mode = 'stream' if raw_mode.lower() in ['s', 'stream'] else 'capture'
+
     print("=" * 60)
     print("ESP32-CAM Multi-Stream Face Recognition System")
+    print(f"Mode Endpoint Terpilih: {mode.upper()} ({'/stream (Port 81)' if mode == 'stream' else '/capture (Port 80)'})")
     print("=" * 60)
 
     # 1. Pendaftaran Database Wajah
@@ -460,18 +573,19 @@ def main():
     print(f"Total database: {len(known_faces_db)} foto dari {total_people} profil terdaftar.\n")
 
     # 2. Inisialisasi & Start Thread tiap Kamera
+    cameras = get_camera_urls(mode)
     streamers = []
-    print("Memulai background thread untuk setiap kamera:")
-    for cam_name, url in CAMERAS.items():
+    print(f"Memulai background thread untuk setiap kamera (Mode: {mode.upper()}):")
+    for cam_name, url in cameras.items():
         print(f" -> Menghubungkan ke [{cam_name}]: {url}")
-        streamer = CameraStreamer(cam_name, url)
+        streamer = CameraStreamer(cam_name, url, mode=mode)
         streamer.start()
         streamers.append(streamer)
 
     print("\nSemua kamera telah diaktifkan.")
     print("Tekan 'q' pada jendela GUI atau di terminal untuk keluar.\n")
 
-    window_name = "Multi-Camera ESP32-CAM Face Recognition"
+    window_name = f"Multi-Camera ESP32-CAM Face Recognition [{mode.upper()}]"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     try:
