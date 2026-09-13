@@ -2,6 +2,8 @@
 
 Sistem pengenalan wajah (Face Recognition) dan verifikasi absensi dua faktor (2-Factor Authentication) berbasis Computer Vision menggunakan model OpenCV YuNet dan SFace. Sistem ini terintegrasi langsung dengan mikrokontroler ESP32-CAM / ESP32-S3, modul Card Reader NFC/RFID (PN532), sensor gerak PIR (HC-SR501), layar LCD 16x2 I2C, serta backend absensi Django.
 
+Kode firmware untuk mikrokontroler ESP32-S3 dapat dilihat pada repositori: **[esp-face-recognition-firmware](https://github.com/EdPootis/esp-face-recognition-firmware)**.
+
 ---
 
 ## 1. Daftar dan Fungsi Setiap File Script
@@ -177,3 +179,10 @@ Ketika verifikasi berhasil, skrip Python mengirimkan balik konfirmasi ke ESP32 m
 GET http://<IP_ESP32>/face?name=<NAMA>&score=<SKOR>&cam=<KAMERA>&time=<WAKTU>
 ```
 Sehingga layar LCD 16x2 pada ESP32 dapat langsung menampilkan informasi nama mahasiswa dan waktu absensi.
+
+---
+
+## 7. Repositori Terkait (Related Repository)
+
+- **ESP32-S3 Hardware Firmware (Arduino C++)**: [EdPootis/esp-face-recognition-firmware](https://github.com/EdPootis/esp-face-recognition-firmware) — Kode firmware untuk ESP32-S3 yang menangani antarmuka modul NFC PN532 (HSU), video streaming OV5640 5MP, layar LCD 16x2 I2C, dan sensor gerak PIR HC-SR501.
+
