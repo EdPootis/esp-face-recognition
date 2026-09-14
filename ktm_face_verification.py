@@ -23,12 +23,29 @@ if sys.platform == 'win32':
 # KONFIGURASI KAMERA & SISTEM VERIFIKASI 2FA (KTM + FACE RECOGNITION)
 # ==============================================================================
 
-# Daftar Kamera ESP32
-CAMERAS = {
-    'ESP32-S3': 'http://10.66.53.60/capture',
-    'ESP32-CAM 1': 'http://10.244.226.130/capture',
-    'ESP32-CAM 2': 'http://10.244.226.31/capture',
+# Daftar IP Address ESP32-CAM
+CAMERA_HOSTS = {
+    'ESP32-S3': '10.7.28.33',
+    'ESP32-CAM 1': '10.244.226.130',
+    'ESP32-CAM 2': '10.244.226.31',
 }
+
+def get_camera_urls(mode='stream'):
+    """
+    Menghasilkan dictionary URL kamera berdasarkan mode yang dipilih:
+    - 'stream'  : http://<IP>:81/stream (MJPEG Continuous Stream via Port 81)
+    - 'capture' : http://<IP>/capture (Snapshot Polling Keep-Alive via Port 80)
+    """
+    cameras = {}
+    for name, host in CAMERA_HOSTS.items():
+        if mode == 'stream':
+            cameras[name] = f"http://{host}:81/stream"
+        else:
+            cameras[name] = f"http://{host}/capture"
+    return cameras
+
+# Default CAMERAS dictionary
+CAMERAS = get_camera_urls('stream')
 
 # Database Folder & File Mapping
 KNOWN_FACES_DIR = 'known_faces'
@@ -779,14 +796,40 @@ def render_verification_banner(frame_width):
 # ==============================================================================
 # MAIN PROGRAM
 # ==============================================================================
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Sistem Verifikasi Absensi 2FA: KTM RFID/NFC + Face Recognition",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    parser.add_argument(
+        'mode_pos',
+        nargs='?',
+        choices=['stream', 'capture', 's', 'c'],
+        default=None,
+        help="Mode endpoint kamera:\n  'stream'  : Menggunakan MJPEG stream (port 81 /stream)\n  'capture' : Menggunakan snapshot polling Keep-Alive (port 80 /capture)\n  (Default: stream)"
+    )
+    parser.add_argument(
+        '-m', '--mode',
+        choices=['stream', 'capture', 's', 'c'],
+        default=None,
+        dest='mode_opt',
+        help="Mode endpoint kamera: 'stream' atau 'capture' (Default: stream)"
+    )
+    parser.add_argument('--cam', type=str, default='ESP32-S3', help="Nama kamera utama yang digunakan (Default: ESP32-S3)")
+    parser.add_argument('--port', type=int, default=TAP_SERVER_PORT, help="Port Webhook Tap Kartu (Default: 5050)")
+    return parser.parse_args()
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Sistem Verifikasi Absensi 2FA: KTM RFID/NFC + Face Recognition")
-    parser.add_argument('--cam', type=str, default='ESP32-S3', help="Nama kamera utama yang digunakan")
-    parser.add_argument('--port', type=int, default=TAP_SERVER_PORT, help="Port Webhook Tap Kartu")
-    args = parser.parse_args()
+    global CAMERAS
+    args = parse_args()
+    raw_mode = args.mode_opt or args.mode_pos or 'stream'
+    mode = 'stream' if raw_mode.lower() in ['s', 'stream'] else 'capture'
+    CAMERAS = get_camera_urls(mode)
 
     print("=" * 65)
     print("  SISTEM VERIFIKASI 2-FACTOR (KTM NFC/RFID + FACE RECOGNITION)")
+    print(f"  Mode Endpoint: {mode.upper()} ({'/stream (Port 81)' if mode == 'stream' else '/capture (Port 80)'})")
     print("=" * 65)
 
     # 1. Mulai Webhook Server Tap Kartu

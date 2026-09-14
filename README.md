@@ -130,6 +130,12 @@ Gunakan mode ini untuk alur absensi operasional:
 python ktm_face_verification.py
 ```
 
+Argumen tambahan yang tersedia:
+- `python ktm_face_verification.py stream` atau `python ktm_face_verification.py -m stream` : Menggunakan MJPEG stream (port 81 /stream, default).
+- `python ktm_face_verification.py capture` atau `python ktm_face_verification.py -m capture` : Menggunakan snapshot polling Keep-Alive (port 80 /capture).
+- `--cam <NAMA_KAMERA>` : Menentukan kamera utama target notifikasi LCD (default: ESP32-S3).
+- `--port <PORT>` : Menentukan port webhook receiver tap kartu (default: 5050).
+
 **Cara Penggunaan:**
 1. Sistem akan masuk ke status **STANDBY** (menunggu tap kartu).
 2. Mahasiswa menempelkan kartu KTM pada modul reader NFC PN532.
@@ -138,8 +144,8 @@ python ktm_face_verification.py
    - **Sukses**: Akses diterima, log absensi tercatat, layar LCD menampilkan konfirmasi nama.
    - **Wajah Tidak Cocok**: Akses ditolak dan peringatan kecurangan dicatat.
    - **Timeout**: Waktu habis jika wajah tidak terdeteksi.
-5. Untuk simulasi pengujian tanpa reader fisik, tekan tombol **`t`** pada jendela GUI untuk memicu tap kartu contoh.
-6. Tekan tombol **`q`** untuk keluar.
+5. Untuk simulasi pengujian tanpa reader fisik, tekan tombol `t` pada jendela GUI untuk memicu tap kartu contoh.
+6. Tekan tombol `q` untuk keluar.
 
 ### b. Menjalankan Mode Multi-Kamera Grid
 Gunakan mode ini untuk memonitor beberapa kamera secara bersamaan:
