@@ -26,7 +26,7 @@ if sys.platform == 'win32':
 CAMERA_HOSTS = {
     'ESP32-CAM 1': '10.244.226.130',
     'ESP32-CAM 2': '10.244.226.31',
-    'ESP32-S3': '10.66.53.60',
+    'ESP32-S3': '10.7.28.33',
 }
 
 
@@ -44,8 +44,31 @@ def get_camera_urls(mode='stream'):
             cameras[name] = f"http://{host}/capture"
     return cameras
 
-# Folder berisi foto referensi wajah
+# Folder berisi foto referensi wajah & database mahasiswa
 KNOWN_FACES_DIR = 'known_faces'
+STUDENTS_DB_FILE = 'students_database.json'
+_student_cache = {}
+
+def load_student_database():
+    """Memuat database mahasiswa dari students_database.json jika ada."""
+    global _student_cache
+    if os.path.exists(STUDENTS_DB_FILE):
+        try:
+            with open(STUDENTS_DB_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                students = data.get('students', {})
+                for uid, info in students.items():
+                    folder = info.get('folder', '').lower()
+                    if folder:
+                        _student_cache[folder] = {
+                            'uid': uid,
+                            'nim': info.get('nim', '-'),
+                            'name': info.get('name', folder),
+                            'kd_org': info.get('kd_org', info.get('major', '01.00.12.01'))
+                        }
+            print(f"[DB] Berhasil memuat {len(_student_cache)} data mahasiswa dari {STUDENTS_DB_FILE}")
+        except Exception as e:
+            print(f"[DB WARN] Gagal membaca {STUDENTS_DB_FILE}: {e}")
 
 # Threshold kemiripan SFace (>= nilai ini dianggap orang yang sama)
 RECOGNITION_THRESHOLD = 0.363
@@ -387,16 +410,42 @@ def encode_image_to_b64(crop_img, quality=85):
 
 
 def send_log_to_dashboard_async(dashboard_url, cam_name, name, score, face_status, face_crop):
-    """Kirim log absensi ke Dashboard Django (receive_log API) secara async."""
+    """Kirim log absensi ke Dashboard Django sesuai format model LogPresentronik secara async."""
     def _worker():
         try:
             foto_b64 = encode_image_to_b64(face_crop)
+            now_dt = datetime.now()
+            mac_addr = CAMERA_HOSTS.get(cam_name, '00:00:00:00:00:00')
+
+            st_info = _student_cache.get(name.lower(), {})
+            nim = st_info.get('nim', '-')
+            uid = st_info.get('uid', '-')
+            kd_org = st_info.get('kd_org', '01.00.12.01')
+            full_name = st_info.get('name', name)
+
             payload = {
-                'nama': name,
+                # Format Standar Model LogPresentronik
+                'no_identitas': nim,
+                'nama': full_name,
+                'rfid_tag': uid,
+                'mac_address': mac_addr,
+                'kd_org': kd_org,
+                'tipe_perangkat': 'ESP32-CAM Face Recognition',
+                'ts_presensi_device': now_dt.strftime('%Y-%m-%d %H:%M:%S'),
+
+                # Atribut Tambahan untuk Monitoring & Audit Face Recognition
                 'kamera': cam_name,
                 'skor': round(float(score), 4),
-                'status': face_status,
-                'foto_b64': foto_b64
+                'status': 'HADIR' if face_status == 'recognized' else 'UNKNOWN',
+                'foto_b64': foto_b64,
+
+                # Alias Kompatibilitas
+                'nim': nim,
+                'person_name': full_name,
+                'similarity': round(float(score), 4),
+                'recognized': (face_status == 'recognized'),
+                'timestamp': now_dt.isoformat(),
+                'image_base64': foto_b64
             }
             data_bytes = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(
@@ -410,7 +459,7 @@ def send_log_to_dashboard_async(dashboard_url, cam_name, name, score, face_statu
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 status_code = resp.getcode()
-                print(f"[DASHBOARD] Log terkirim ({status_code}) -> Kamera: {cam_name} | Nama: {name} | Status: {face_status} | Skor: {score:.2f}")
+                print(f"[DASHBOARD] Log terkirim ({status_code}) -> Kamera: {cam_name} | Nama: {full_name} ({nim}) | Skor: {score:.2f}")
         except Exception as e:
             print(f"[DASHBOARD ERROR] Gagal mengirim log ({cam_name} / {name}): {e}")
 
@@ -567,7 +616,8 @@ def main():
     print(f"Mode Endpoint Terpilih: {mode.upper()} ({'/stream (Port 81)' if mode == 'stream' else '/capture (Port 80)'})")
     print("=" * 60)
 
-    # 1. Pendaftaran Database Wajah
+    # 1. Pendaftaran Database Wajah & Profil Mahasiswa
+    load_student_database()
     known_faces_db = enroll_known_faces()
     total_people = len(set(n for n, _ in known_faces_db))
     print(f"Total database: {len(known_faces_db)} foto dari {total_people} profil terdaftar.\n")

@@ -64,7 +64,7 @@ RESULT_DISPLAY_DURATION = 4.0
 TAP_SERVER_PORT = 5050
 
 # Konfigurasi Dashboard Django (Log Absensi)
-DASHBOARD_URL = 'http://10.67.46.241:8000/api/log/'
+DASHBOARD_URL = 'http://10.7.28.21:8000/api/log/'
 ENABLE_DASHBOARD = True
 
 # Resolusi Tampilan Tile Kamera
@@ -135,7 +135,7 @@ class StudentDatabase:
         default_data = {
             "_comment": "Database Pemetaan UID Kartu KTM ke Profil Mahasiswa untuk Verifikasi 2FA",
             "students": {
-                "DEA35B89": {"nim": "13520001", "name": "Edmond", "folder": "edmond", "major": "TEsting "},
+                "DEA35B89": {"nim": "2306208363", "name": "Edmond", "folder": "edmond", "major": "TEsting "},
                 "04A12B9C": {"nim": "13520002", "name": "Juan", "folder": "juan", "major": "HihiHAHA"},
                 "A1B2C3D4": {"nim": "13520003", "name": "Topa", "folder": "topa", "major": "Sistem Informasi"}
             }
@@ -248,14 +248,17 @@ class VerificationManager:
                     self.result_message = f"VERIFIKASI SUKSES! {expected_name} (Skor: {score:.2f})"
                     print(f"\n[VERIFIKASI SUKSES] ✓ Wajah {expected_name} terverifikasi! (Skor: {score:.2f})")
 
-                    # Kirim data kehadiran ke Dashboard Django
+                    # Kirim data kehadiran ke Dashboard Django (Format LogPresentronik)
                     send_log_to_dashboard(
                         cam_name=cam_name,
                         person_name=expected_name,
                         similarity=score,
                         recognized=True,
                         face_image=raw_frame,
-                        nim=self.student_info.get('nim', '-')
+                        nim=self.student_info.get('nim', '-'),
+                        uid=self.current_uid,
+                        kd_org=self.student_info.get('kd_org', self.student_info.get('major', '01.00.12.01')),
+                        status='HADIR'
                     )
 
                     # Update tampilan LCD ESP32
@@ -604,39 +607,60 @@ def send_face_to_esp32_async(cam_url, name, score, cam_name):
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_image=None, nim="-"):
-    """Mengirim log kehadiran lengkap dengan NIM ke Django Dashboard API."""
+def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_image=None, nim="-", uid="-", kd_org="01.00.12.01", status="HADIR"):
+    """
+    Mengirim log kehadiran ke Django Dashboard API sesuai skema model LogPresentronik.
+    """
     if not ENABLE_DASHBOARD:
         return
 
     def _worker():
         try:
-            image_base64 = None
+            foto_b64 = None
             if face_image is not None:
                 success, encoded_img = cv2.imencode('.jpg', face_image, [cv2.IMWRITE_JPEG_QUALITY, 85])
                 if success:
-                    image_base64 = base64.b64encode(encoded_img.tobytes()).decode('utf-8')
+                    raw_b64 = base64.b64encode(encoded_img.tobytes()).decode('utf-8')
+                    foto_b64 = f"data:image/jpeg;base64,{raw_b64}"
+
+            now_dt = datetime.now()
+            mac_addr = CAMERA_HOSTS.get(cam_name, '00:00:00:00:00:00')
 
             payload = {
-                'camera_name': cam_name,
+                # Format Standar Model LogPresentronik
+                'no_identitas': nim if nim else '-',
+                'nama': person_name,
+                'rfid_tag': uid if uid else '-',
+                'mac_address': mac_addr,
+                'kd_org': kd_org if kd_org else '01.00.12.01',
+                'tipe_perangkat': 'ESP32-S3 Face Recognition',
+                'ts_presensi_device': now_dt.strftime('%Y-%m-%d %H:%M:%S'),
+
+                # Atribut Tambahan untuk Monitoring & Audit Face Recognition
+                'kamera': cam_name,
+                'skor': round(float(similarity), 4),
+                'status': status,
+                'foto_b64': foto_b64,
+
+                # Alias Kompatibilitas
+                'nim': nim if nim else '-',
                 'person_name': person_name,
-                'nim': nim,
                 'similarity': round(float(similarity), 4),
                 'recognized': recognized,
-                'timestamp': datetime.now().isoformat(),
-                'image_base64': image_base64
+                'timestamp': now_dt.isoformat(),
+                'image_base64': foto_b64
             }
 
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(
                 DASHBOARD_URL,
                 data=data,
-                headers={'Content-Type': 'application/json', 'User-Agent': 'ESP32CAM-Client'},
+                headers={'Content-Type': 'application/json', 'User-Agent': 'FaceRecClient'},
                 method='POST'
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
-                if resp.status not in (200, 201):
-                    print(f"[DASHBOARD WARN] Status code: {resp.status}")
+                status_code = resp.getcode()
+                print(f"[DASHBOARD] Log kehadiran terkirim ({status_code}) -> {person_name} ({nim}) | UID: {uid} | Skor: {similarity:.2f}")
         except Exception as e:
             print(f"[DASHBOARD ERROR] Gagal mengirim log ({cam_name} / {person_name}): {e}")
 
