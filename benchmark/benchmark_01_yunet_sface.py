@@ -9,10 +9,16 @@ Face Recognition: SFace (face_recognition_sface_2021dec.onnx, ~37MB)
 Backend         : OpenCV cv2.FaceDetectorYN + cv2.FaceRecognizerSF
                   Mendukung CUDA (Jetson Nano) dan CPU (Raspberry Pi)
 
+Opsi --rec-backend ort:
+  Inferensi SFace dijalankan lewat ONNX Runtime (CUDAExecutionProvider jika ada),
+  sama seperti model FR pada benchmark #2 dan #3. alignCrop() dan match() tetap
+  memakai OpenCV. --no-cuda hanya berlaku untuk OpenCV DNN (YuNet / SFace opencv).
+
 Cara Menjalankan:
   python benchmark_01_yunet_sface.py --stream-url http://10.7.28.33:81/stream
   python benchmark_01_yunet_sface.py --stream-url http://10.7.28.33:81/stream --no-cuda
   python benchmark_01_yunet_sface.py --stream-url http://10.7.28.33:81/stream --duration 30
+  python benchmark_01_yunet_sface.py --video-file benchmark_video.mp4 --no-cuda --rec-backend ort
 
 Target: Jetson Nano / Raspberry Pi 3
 ===========================================================================
@@ -51,6 +57,14 @@ DETECT_MODEL_URL = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_de
 RECOG_MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                                  'face_recognition_sface_2021dec.onnx')
 RECOG_MODEL_URL = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx'
+
+# Salinan SFace untuk ONNX Runtime: bobot yang sama, tetapi 174 initializer dihapus dari
+# daftar graph input. Di file asli (exporter lama) bobot ikut terdaftar sebagai input,
+# sehingga ONNX Runtime tidak bisa constant folding (±1.7x lebih lambat) dan mencetak
+# ratusan warning. Output identik dengan OpenCV (selisih < 1e-5). Dibuat di laptop dengan
+# paket `onnx`; jika file tidak ada, file asli tetap dipakai.
+RECOG_MODEL_ORT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                     'face_recognition_sface_2021dec_ort.onnx')
 
 
 # ==============================================================================
@@ -110,6 +124,16 @@ def init_models(det_size, enable_cuda=True):
     target_id = getattr(cv2.dnn, 'DNN_TARGET_CPU', 0)
     active_backend = "CPU (Default)"
 
+    # OpenCV dari pip punya konstanta DNN_BACKEND_CUDA walau tanpa CUDA, dan diam-diam
+    # fallback ke CPU tanpa error. Cek device CUDA dulu agar label backend tidak salah.
+    try:
+        cuda_device_count = cv2.cuda.getCudaEnabledDeviceCount()
+    except Exception:
+        cuda_device_count = 0
+    if enable_cuda and cuda_device_count == 0:
+        print("  ℹ️  OpenCV tidak mendeteksi device CUDA, memakai CPU.")
+        enable_cuda = False
+
     if enable_cuda:
         cuda_backend = getattr(cv2.dnn, 'DNN_BACKEND_CUDA', None)
         cuda_fp16 = getattr(cv2.dnn, 'DNN_TARGET_CUDA_FP16', None)
@@ -151,6 +175,51 @@ def init_models(det_size, enable_cuda=True):
     )
     recognizer = create_face_recognizer(RECOG_MODEL_PATH, backend_id=backend_id, target_id=target_id)
     return detector, enroll_det, recognizer, active_backend
+
+
+class SFaceORTRecognizer:
+    """
+    SFace dengan inferensi via ONNX Runtime. Antarmuka sama dengan cv2.FaceRecognizerSF:
+    alignCrop() dan match() tetap dari OpenCV (CPU, operasi ringan), hanya feature()
+    (inferensi model, bagian terberat) yang dijalankan ONNX Runtime.
+    """
+
+    def __init__(self, model_path, use_cuda=True):
+        import onnxruntime as ort
+
+        providers = []
+        if use_cuda and 'CUDAExecutionProvider' in ort.get_available_providers():
+            providers.append('CUDAExecutionProvider')
+        providers.append('CPUExecutionProvider')
+
+        ort_model_path = RECOG_MODEL_ORT_PATH if os.path.exists(RECOG_MODEL_ORT_PATH) else model_path
+        if ort_model_path == model_path:
+            print(f"  ⚠️  {os.path.basename(RECOG_MODEL_ORT_PATH)} tidak ditemukan, memakai model asli "
+                  f"(ONNX Runtime lebih lambat karena tidak bisa constant folding).")
+        self.model_file = os.path.basename(ort_model_path)
+
+        sess_options = ort.SessionOptions()
+        sess_options.log_severity_level = 3  # sembunyikan warning per-initializer
+        self.session = ort.InferenceSession(ort_model_path, sess_options=sess_options, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.provider = self.session.get_providers()[0]
+        self._cv = create_face_recognizer(model_path)  # hanya untuk alignCrop() & match()
+
+        # Warm-up (run pertama CUDA jauh lebih lambat karena inisialisasi kernel)
+        for _ in range(3):
+            self.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+
+    def alignCrop(self, img, face):
+        return self._cv.alignCrop(img, face)
+
+    def feature(self, aligned_img):
+        # Preprocessing identik dengan FaceRecognizerSF::feature() di OpenCV:
+        # blobFromImage(img, scale=1, size=112x112, mean=0, swapRB=true, crop=false)
+        blob = cv2.dnn.blobFromImage(aligned_img, 1.0, (112, 112), (0, 0, 0), swapRB=True, crop=False)
+        return self.session.run(None, {self.input_name: blob})[0]
+
+    def match(self, feature1, feature2, dis_type):
+        return self._cv.match(feature1, feature2, dis_type)
 
 
 # ==============================================================================
@@ -247,6 +316,11 @@ def run_benchmark(args):
     detector, enroll_det, recognizer, active_backend = init_models(
         det_size, enable_cuda=not args.no_cuda
     )
+    if args.rec_backend == 'ort':
+        print("  🔧 Memuat SFace via ONNX Runtime...")
+        recognizer = SFaceORTRecognizer(RECOG_MODEL_PATH)
+        print(f"  ✓ SFace ONNX Runtime aktif: {recognizer.provider} ({recognizer.model_file})")
+        active_backend = f"YuNet: OpenCV DNN {active_backend} | SFace: ONNX Runtime ({recognizer.provider})"
     threshold = args.threshold if args.threshold is not None else DEFAULT_THRESHOLD
 
     # 3. Enroll database
@@ -417,15 +491,16 @@ def run_benchmark(args):
         print("\n  ⏹️  Benchmark dihentikan.")
 
     finally:
+        # 7. Generate & simpan laporan SEBELUM streamer.stop(): di Jetson, FFmpeg bisa
+        # abort (Assertion fctx->async_lock failed) saat cap.release() sehingga hasil hilang.
+        report = collector.get_full_report()
+        report["device_info"] = device_info
+        report["model_info"] = model_info
+        save_report(report, PAIR_TAG)
+
         streamer.stop()
         if not args.no_display:
             cv2.destroyAllWindows()
-
-    # 7. Generate & simpan laporan
-    report = collector.get_full_report()
-    report["device_info"] = device_info
-    report["model_info"] = model_info
-    save_report(report, PAIR_TAG)
 
     # 8. Print ringkasan akhir
     print(f"\n{'=' * 72}")
@@ -438,5 +513,10 @@ def run_benchmark(args):
 # ==============================================================================
 if __name__ == '__main__':
     parser = create_base_argparser(PAIR_NAME)
+    parser.add_argument(
+        '--rec-backend', choices=['opencv', 'ort'], default='opencv',
+        help="Runtime inferensi SFace: 'opencv' (OpenCV DNN) atau 'ort' (ONNX Runtime,\n"
+             "CUDA jika tersedia). Default: opencv"
+    )
     args = parser.parse_args()
     run_benchmark(args)
