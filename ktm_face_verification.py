@@ -260,6 +260,9 @@ class VerificationManager:
         self.matched_score = 0.0
         self.detected_person = None
         self.cam_name = "ESP32-S3"
+        # Wajah terdaftar lain yang terlihat selama VERIFYING: {folder: jumlah frame} & {folder: skor terbaik}
+        self.mismatch_counts = {}
+        self.mismatch_best_score = {}
         self.lock = threading.Lock()
 
     def trigger_card_tap(self, uid, cam_name="ESP32-S3"):
@@ -273,6 +276,8 @@ class VerificationManager:
             self.state_start_time = time.time()
             self.matched_score = 0.0
             self.detected_person = None
+            self.mismatch_counts = {}
+            self.mismatch_best_score = {}
 
             if student:
                 self.student_info = student
@@ -280,9 +285,9 @@ class VerificationManager:
                 self.result_message = f"Halo {student['name']} ({student['nim']})! Silakan lihat kamera..."
                 print(f"\n[TAP KTM] Terbaca UID: {clean_uid} -> {student['name']} ({student['nim']})")
                 print(f" -> Memulai verifikasi wajah... (Timeout: {VERIFICATION_TIMEOUT}s)")
-                
-                # Kirim notifikasi ke LCD ESP32
-                send_face_to_esp32_async(CAMERAS.get(cam_name, ''), student['name'], 0.0, cam_name)
+                # Tidak mengirim /face di sini: firmware memperlakukan /face sebagai hasil FR,
+                # sehingga countdown LCD langsung berhenti dan nama pemilik kartu tampil seolah
+                # sudah terverifikasi. LCD sudah menampilkan "Scan Muka" sendiri saat tap.
             else:
                 # State diubah lebih dulu: GUI membaca student_info saat state == VERIFYING
                 self.state = VerificationState.REJECTED_UNKNOWN
@@ -303,11 +308,27 @@ class VerificationManager:
 
             if self.state == VerificationState.VERIFYING:
                 if now - self.state_start_time > VERIFICATION_TIMEOUT:
-                    self.state = VerificationState.TIMEOUT_NO_FACE
                     self.last_result_time = now
-                    self.result_message = "TIMEOUT! Wajah tidak terdeteksi / tidak cocok."
-                    print(f"[VERIFIKASI GAGAL] Timeout {VERIFICATION_TIMEOUT}s habis untuk {self.student_info['name']}.")
-                    send_face_to_esp32_async(CAMERAS.get(self.cam_name, ''), "TIMEOUT!", 0.0, self.cam_name)
+                    expected_name = self.student_info['name']
+                    if self.mismatch_counts:
+                        # Pemilik kartu tidak terlihat, tetapi wajah orang lain yang terdaftar terlihat
+                        # (kemungkinan titip absen). Laporkan orang yang paling sering terdeteksi.
+                        other = max(self.mismatch_counts, key=self.mismatch_counts.get)
+                        other_score = self.mismatch_best_score[other]
+                        self.state = VerificationState.REJECTED_MISMATCH
+                        self.matched_score = other_score
+                        self.detected_person = other
+                        self.result_message = (f"DITOLAK! Dalam {VERIFICATION_TIMEOUT:.0f} detik hanya terdeteksi "
+                                               f"wajah '{other}', bukan '{expected_name}'!")
+                        print(f"\n[🚨 PERINGATAN KECURANGAN] Kartu milik {expected_name}, tetapi selama "
+                              f"{VERIFICATION_TIMEOUT}s hanya wajah {other} yang terdeteksi "
+                              f"({self.mismatch_counts[other]} frame, skor terbaik {other_score:.2f})!")
+                        send_face_to_esp32_async(CAMERAS.get(self.cam_name, ''), "WAJAH TDK COCOK!", other_score, self.cam_name)
+                    else:
+                        self.state = VerificationState.TIMEOUT_NO_FACE
+                        self.result_message = "TIMEOUT! Wajah tidak terdeteksi / tidak cocok."
+                        print(f"[VERIFIKASI GAGAL] Timeout {VERIFICATION_TIMEOUT}s habis untuk {expected_name}.")
+                        send_face_to_esp32_async(CAMERAS.get(self.cam_name, ''), "TIMEOUT!", 0.0, self.cam_name)
 
             elif self.state != VerificationState.IDLE:
                 if now - self.last_result_time > RESULT_DISPLAY_DURATION:
@@ -360,16 +381,16 @@ class VerificationManager:
                     # Update tampilan LCD ESP32
                     send_face_to_esp32_async(CAMERAS.get(cam_name, ''), expected_name, score, cam_name)
 
-                # KASUS 2: WAJAH MILIK ORANG LAIN (PERCOBAAN TITIP ABSEN / JOKI!)
-                elif recognized_name != "Unknown" and recognized_name.lower() != expected_folder:
-                    self.state = VerificationState.REJECTED_MISMATCH
-                    self.last_result_time = now
-                    self.matched_score = score
-                    self.detected_person = recognized_name
-                    self.result_message = f"DITOLAK! Wajah terdeteksi sebagai '{recognized_name}', bukan '{expected_name}'!"
-                    print(f"\n[🚨 PERINGATAN KECURANGAN] Kartu milik {expected_name}, tapi wajah yang berdiri di depan kamera adalah {recognized_name}!")
-                    
-                    send_face_to_esp32_async(CAMERAS.get(cam_name, ''), "WAJAH TDK COCOK!", score, cam_name)
+                # KASUS 2: WAJAH ORANG LAIN YANG TERDAFTAR
+                # Di ruang kelas bisa ada beberapa orang di depan kamera, jadi verifikasi tidak
+                # langsung ditolak: wajahnya dicatat dan pemilik kartu tetap ditunggu sampai
+                # VERIFICATION_TIMEOUT. Keputusan DITOLAK (mismatch) diambil di update().
+                elif recognized_name != "Unknown":
+                    if recognized_name not in self.mismatch_counts:
+                        print(f"[VERIFIKASI] Wajah lain terdeteksi: {recognized_name} ({score:.2f}), "
+                              f"tetap menunggu wajah {expected_name}...")
+                    self.mismatch_counts[recognized_name] = self.mismatch_counts.get(recognized_name, 0) + 1
+                    self.mismatch_best_score[recognized_name] = max(score, self.mismatch_best_score.get(recognized_name, 0.0))
 
 
 verif_manager = VerificationManager()
@@ -824,6 +845,14 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
 
     recognized_person_in_frame = None
     recognized_score_in_frame = 0.0
+    recognized_rank_in_frame = -1
+
+    # Jika ada beberapa wajah di frame: pemilik kartu diprioritaskan, lalu wajah terdaftar
+    # lain, lalu Unknown, agar wajah pemilik kartu tidak tertimpa wajah orang lain
+    expected_folder = None
+    student_info = verif_manager.student_info
+    if verif_manager.state == VerificationState.VERIFYING and student_info:
+        expected_folder = student_info.get('folder', '').lower()
 
     if faces is not None:
         for face in faces:
@@ -841,8 +870,16 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
             embedding = get_embedding(raw_frame, face)
             name, score = recognize(embedding, known_faces_db)
 
-            recognized_person_in_frame = name
-            recognized_score_in_frame = score
+            if expected_folder and name.lower() == expected_folder:
+                rank = 2
+            elif name != "Unknown":
+                rank = 1
+            else:
+                rank = 0
+            if (rank, score) > (recognized_rank_in_frame, recognized_score_in_frame):
+                recognized_person_in_frame = name
+                recognized_score_in_frame = score
+                recognized_rank_in_frame = rank
 
             # Skalakan koordinat bounding box ke ukuran display
             dx = int(x * scale_x)
@@ -914,7 +951,12 @@ def render_verification_banner(frame_width):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
         cv2.putText(banner, f"Mahasiswa: {student['name']} | NIM: {student['nim']} | Jurusan: {student.get('major', '-')}",
                     (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        cv2.putText(banner, "Silakan pandang lurus ke lensa kamera...", (20, 95),
+        others = list(verif_manager.mismatch_counts)
+        if others:
+            hint = f"Wajah lain terdeteksi: {', '.join(others)} | Tetap menunggu wajah {student['name']}..."
+        else:
+            hint = "Silakan pandang lurus ke lensa kamera..."
+        cv2.putText(banner, hint, (20, 95),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 230, 255), 1)
 
         # Progress bar countdown
