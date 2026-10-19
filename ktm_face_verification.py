@@ -57,8 +57,8 @@ RECOGNITION_THRESHOLD = 0.363
 # Durasi Jendela Waktu Verifikasi Wajah setelah Tap Kartu (Detik)
 VERIFICATION_TIMEOUT = 8.0
 
-# Durasi Tampilan Hasil Verifikasi (Sukses / Gagal) sebelum kembali ke Standby (Detik)
-RESULT_DISPLAY_DURATION = 4.0
+# Durasi Tampilan Hasil Verifikasi (Sukses / Gagal / Timeout) sebelum GUI kembali ke Standby (Detik)
+RESULT_DISPLAY_DURATION = 3.0
 
 # Port HTTP Webhook Server (Untuk menerima notifikasi tap kartu dari ESP32 via WiFi)
 TAP_SERVER_PORT = 5050
@@ -77,6 +77,11 @@ detect_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_de
 
 recog_model_path = 'face_recognition_sface_2021dec.onnx'
 recog_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx'
+
+# Salinan SFace untuk ONNX Runtime (--rec-backend): bobot sama, tetapi initializer dihapus
+# dari daftar graph input agar ONNX Runtime bisa constant folding. Output identik dengan
+# OpenCV (selisih < 1e-5). Jika file tidak ada, file asli tetap dipakai.
+recog_model_ort_path = 'face_recognition_sface_2021dec_ort.onnx'
 
 # Unduh model jika belum ada
 for path, dl_url in [(detect_model_path, detect_model_url), (recog_model_path, recog_model_url)]:
@@ -104,6 +109,73 @@ enroll_detector = cv2.FaceDetectorYN_create(
 )
 
 recognizer = cv2.FaceRecognizerSF_create(model=recog_model_path, config='')
+
+
+class SFaceORTRecognizer:
+    """
+    SFace dengan inferensi via ONNX Runtime. Antarmuka sama dengan cv2.FaceRecognizerSF:
+    alignCrop() dan match() tetap dari OpenCV, hanya feature() (inferensi model, bagian
+    terberat) yang dijalankan ONNX Runtime.
+    Hasil benchmark di Jetson Nano: recognition 185 ms (OpenCV DNN) -> 37 ms (ONNX Runtime
+    GPU) dengan embedding identik. Lihat benchmark/benchmark_01_yunet_sface.py --rec-backend ort.
+    """
+
+    def __init__(self, cv_recognizer, ort_module, providers):
+        model_path = recog_model_ort_path if os.path.exists(recog_model_ort_path) else recog_model_path
+        if model_path == recog_model_path:
+            print(f"[WARN] {recog_model_ort_path} tidak ditemukan, memakai model asli "
+                  f"(ONNX Runtime lebih lambat karena tidak bisa constant folding).")
+
+        sess_options = ort_module.SessionOptions()
+        sess_options.log_severity_level = 3  # sembunyikan warning per-initializer
+        self.session = ort_module.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.provider = self.session.get_providers()[0]
+        self.device = 'GPU' if self.provider == 'CUDAExecutionProvider' else 'CPU'
+        self._cv = cv_recognizer
+
+        # Warm-up (run pertama CUDA jauh lebih lambat karena inisialisasi kernel)
+        for _ in range(3):
+            self.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+
+    def alignCrop(self, img, face):
+        return self._cv.alignCrop(img, face)
+
+    def feature(self, aligned_img):
+        # Preprocessing identik dengan FaceRecognizerSF::feature() di OpenCV
+        blob = cv2.dnn.blobFromImage(aligned_img, 1.0, (112, 112), (0, 0, 0), swapRB=True, crop=False)
+        return self.session.run(None, {self.input_name: blob})[0]
+
+    def match(self, feature1, feature2, dis_type):
+        return self._cv.match(feature1, feature2, dis_type)
+
+
+def load_ort_recognizer(rec_backend, cv_recognizer):
+    """
+    Memuat SFace via ONNX Runtime sesuai --rec-backend. Mengembalikan None jika SFace
+    tetap memakai OpenCV DNN.
+    - 'opencv': selalu OpenCV DNN.
+    - 'auto'  : ONNX Runtime jika terpasang (GPU jika ada, selain itu CPU), selain itu
+                OpenCV DNN. Di CPU laptop pun feature() ±2x lebih cepat (±7 ms vs ±15 ms);
+                di Raspberry Pi belum diuji.
+    - 'ort'   : sama dengan 'auto', tetapi memberi peringatan jika onnxruntime tidak ada.
+    """
+    if rec_backend == 'opencv':
+        return None
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        if rec_backend == 'ort':
+            print("[WARN] onnxruntime belum terpasang, SFace memakai OpenCV DNN.")
+        return None
+
+    has_cuda = 'CUDAExecutionProvider' in ort.get_available_providers()
+    providers = (['CUDAExecutionProvider'] if has_cuda else []) + ['CPUExecutionProvider']
+    try:
+        return SFaceORTRecognizer(cv_recognizer, ort, providers)
+    except Exception as e:
+        print(f"[WARN] ONNX Runtime gagal dimuat ({e}), SFace memakai OpenCV DNN.")
+        return None
 
 
 # ==============================================================================
@@ -187,6 +259,7 @@ class VerificationManager:
         self.result_message = ""
         self.matched_score = 0.0
         self.detected_person = None
+        self.cam_name = "ESP32-S3"
         self.lock = threading.Lock()
 
     def trigger_card_tap(self, uid, cam_name="ESP32-S3"):
@@ -195,6 +268,7 @@ class VerificationManager:
             clean_uid = uid.replace(" ", "").upper()
             student = student_db.get_student_by_uid(clean_uid)
 
+            self.cam_name = cam_name
             self.current_uid = clean_uid
             self.state_start_time = time.time()
             self.matched_score = 0.0
@@ -210,26 +284,48 @@ class VerificationManager:
                 # Kirim notifikasi ke LCD ESP32
                 send_face_to_esp32_async(CAMERAS.get(cam_name, ''), student['name'], 0.0, cam_name)
             else:
-                self.student_info = None
+                # State diubah lebih dulu: GUI membaca student_info saat state == VERIFYING
                 self.state = VerificationState.REJECTED_UNKNOWN
+                self.student_info = None
                 self.last_result_time = time.time()
                 self.result_message = f"KARTU TIDAK TERDAFTAR! (UID: {clean_uid})"
                 print(f"\n[TAP KTM REJECTED] UID {clean_uid} tidak terdaftar di database!")
                 send_face_to_esp32_async(CAMERAS.get(cam_name, ''), "KARTU TDK DIKENAL", 0.0, cam_name)
 
-    def process_face_recognition(self, recognized_name, score, raw_frame, cam_name):
-        """Memvalidasi wajah yang terdeteksi saat dalam status VERIFYING."""
+    def update(self):
+        """
+        Dipanggil setiap iterasi main loop, terlepas dari ada/tidaknya frame atau wajah:
+        1. Mengakhiri VERIFYING saat jendela waktu verifikasi habis.
+        2. Mengembalikan GUI ke IDLE setelah hasil ditampilkan RESULT_DISPLAY_DURATION detik.
+        """
         with self.lock:
             now = time.time()
 
-            # 1. Cek Timeout jika sedang dalam mode VERIFYING
             if self.state == VerificationState.VERIFYING:
                 if now - self.state_start_time > VERIFICATION_TIMEOUT:
                     self.state = VerificationState.TIMEOUT_NO_FACE
                     self.last_result_time = now
                     self.result_message = "TIMEOUT! Wajah tidak terdeteksi / tidak cocok."
                     print(f"[VERIFIKASI GAGAL] Timeout {VERIFICATION_TIMEOUT}s habis untuk {self.student_info['name']}.")
-                    send_face_to_esp32_async(CAMERAS.get(cam_name, ''), "TIMEOUT!", 0.0, cam_name)
+                    send_face_to_esp32_async(CAMERAS.get(self.cam_name, ''), "TIMEOUT!", 0.0, self.cam_name)
+
+            elif self.state != VerificationState.IDLE:
+                if now - self.last_result_time > RESULT_DISPLAY_DURATION:
+                    self.state = VerificationState.IDLE
+                    self.current_uid = None
+                    self.student_info = None
+                    self.result_message = ""
+                    self.matched_score = 0.0
+                    self.detected_person = None
+
+    def process_face_recognition(self, recognized_name, score, raw_frame, cam_name):
+        """Memvalidasi wajah yang terdeteksi saat dalam status VERIFYING."""
+        with self.lock:
+            now = time.time()
+
+            # Timeout & reset ke IDLE ditangani update(); di sini hanya pencocokan wajah
+            if self.state == VerificationState.VERIFYING:
+                if now - self.state_start_time > VERIFICATION_TIMEOUT:
                     return
 
                 # Jika belum ada wajah terdeteksi pada frame ini, tunggu frame berikutnya
@@ -274,15 +370,6 @@ class VerificationManager:
                     print(f"\n[🚨 PERINGATAN KECURANGAN] Kartu milik {expected_name}, tapi wajah yang berdiri di depan kamera adalah {recognized_name}!")
                     
                     send_face_to_esp32_async(CAMERAS.get(cam_name, ''), "WAJAH TDK COCOK!", score, cam_name)
-
-            # 2. Reset otomatis ke IDLE setelah hasil ditampilkan beberapa detik
-            elif self.state in (VerificationState.SUCCESS, VerificationState.REJECTED_MISMATCH,
-                                VerificationState.REJECTED_UNKNOWN, VerificationState.TIMEOUT_NO_FACE):
-                if now - self.last_result_time > RESULT_DISPLAY_DURATION:
-                    self.state = VerificationState.IDLE
-                    self.current_uid = None
-                    self.student_info = None
-                    self.result_message = ""
 
 
 verif_manager = VerificationManager()
@@ -353,7 +440,19 @@ def start_tap_server(port=TAP_SERVER_PORT):
 # ==============================================================================
 # CLASS MULTITHREADING STREAMER (Sama dengan multi_esp32cam.py)
 # ==============================================================================
+# Ada sejak Python 3.5; read1() mengembalikan data yang sudah tiba tanpa menunggu buffer penuh
+_HTTP_HAS_READ1 = 'read1' in http.client.HTTPResponse.__dict__
+
+# Batas buffer stream tanpa marker EOI (data rusak / bukan JPEG) sebelum dibuang
+MAX_STREAM_BUFFER = 2 * 1024 * 1024
+
+
 class CameraStreamer(threading.Thread):
+    """
+    Thread pembaca kamera. Thread ini hanya mengambil JPEG mentah terbaru dari socket
+    agar socket selalu terkuras (ESP32 tidak tertahan saat mengirim). Decode JPEG
+    dilakukan di get_latest_frame(), hanya untuk frame yang benar-benar dipakai.
+    """
     def __init__(self, cam_name, url, timeout=4.0):
         super().__init__(daemon=True)
         self.cam_name = cam_name
@@ -366,6 +465,17 @@ class CameraStreamer(threading.Thread):
         self.fps = 0.0
         self._frame_count = 0
         self._fps_timer = time.time()
+
+        # JPEG mentah terbaru dari thread pembaca, di-decode secara lazy
+        self._jpeg = None
+        self._jpeg_seq = 0
+        self._decoded_seq = 0
+        self.decode_errors = 0
+
+        # Diagnostik putus-sambung stream
+        self.last_error = None
+        self.disconnect_count = 0
+        self._disconnected_since = None
 
         parsed = urllib.parse.urlparse(self.url)
         self.host = parsed.netloc
@@ -380,6 +490,48 @@ class CameraStreamer(threading.Thread):
             self.conn = http.client.HTTPConnection(self.host, timeout=self.timeout)
         return self.conn
 
+    def _store_jpeg(self, jpg_data):
+        with self.lock:
+            was_connected = self.connected
+            self._jpeg = jpg_data
+            self._jpeg_seq += 1
+            self.connected = True
+
+        if not was_connected:
+            if self._disconnected_since is not None:
+                down_for = time.time() - self._disconnected_since
+                print(f"[STREAM {self.cam_name}] Tersambung kembali setelah {down_for:.1f} detik "
+                      f"(putus ke-{self.disconnect_count})")
+            else:
+                print(f"[STREAM {self.cam_name}] Tersambung ke {self.url}")
+            self._disconnected_since = None
+            self.last_error = None
+            self._frame_count = 0
+            self._fps_timer = time.time()
+
+        self._frame_count += 1
+        now = time.time()
+        if now - self._fps_timer >= 1.0:
+            self.fps = self._frame_count / (now - self._fps_timer)
+            self._frame_count = 0
+            self._fps_timer = now
+
+    def _mark_disconnected(self, reason):
+        with self.lock:
+            was_connected = self.connected
+            self.connected = False
+
+        if was_connected:
+            self.disconnect_count += 1
+            self._disconnected_since = time.time()
+            print(f"[STREAM {self.cam_name}] Stream putus: {reason} -> mencoba reconnect...")
+        elif reason != self.last_error:
+            # Saat reconnect terus gagal, cetak hanya jika penyebabnya berubah agar log tidak banjir
+            if self._disconnected_since is None:
+                self._disconnected_since = time.time()
+            print(f"[STREAM {self.cam_name}] Belum tersambung: {reason}")
+        self.last_error = reason
+
     def _run_stream(self):
         conn = self._get_connection()
         conn.request('GET', self.path, headers={'User-Agent': 'ESP32CAM-Client'})
@@ -387,48 +539,32 @@ class CameraStreamer(threading.Thread):
 
         if resp.status != 200:
             resp.read()
-            with self.lock:
-                self.connected = False
+            self._mark_disconnected(f"HTTP {resp.status} {resp.reason}")
             time.sleep(0.5)
             return
 
-        bytes_buffer = b''
+        if _HTTP_HAS_READ1:
+            read_chunk = lambda: resp.read1(65536)
+        else:
+            read_chunk = lambda: resp.read(4096)
+
+        buf = bytearray()
         while self.running:
-            chunk = resp.read(4096)
+            chunk = read_chunk()
             if not chunk:
-                break
-            bytes_buffer += chunk
+                raise ConnectionError("koneksi ditutup oleh kamera")
+            buf += chunk
 
-            a = bytes_buffer.find(b'\xff\xd8')
-            b = bytes_buffer.find(b'\xff\xd9', a) if a != -1 else -1
-
-            if a != -1 and b != -1 and b > a:
-                last_b = bytes_buffer.rfind(b'\xff\xd9')
-                last_a = bytes_buffer.rfind(b'\xff\xd8', 0, last_b)
-
-                if last_a != -1 and last_b != -1 and last_b > last_a:
-                    jpg_data = bytes_buffer[last_a:last_b + 2]
-                    bytes_buffer = bytes_buffer[last_b + 2:]
-                else:
-                    jpg_data = bytes_buffer[a:b + 2]
-                    bytes_buffer = bytes_buffer[b + 2:]
-
-                decoded = cv2.imdecode(np.frombuffer(jpg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
-
-                if decoded is not None:
-                    with self.lock:
-                        self.frame = decoded
-                        self.connected = True
-                    self._frame_count += 1
-
-                    now = time.time()
-                    if now - self._fps_timer >= 1.0:
-                        self.fps = self._frame_count / (now - self._fps_timer)
-                        self._frame_count = 0
-                        self._fps_timer = now
-                else:
-                    with self.lock:
-                        self.connected = False
+            # Ambil JPEG lengkap terbaru; frame lama yang menumpuk di buffer dilewati
+            end = buf.rfind(b'\xff\xd9')
+            if end == -1:
+                if len(buf) > MAX_STREAM_BUFFER:
+                    del buf[:]
+                continue
+            start = buf.rfind(b'\xff\xd8', 0, end)
+            if start != -1:
+                self._store_jpeg(bytes(buf[start:end + 2]))
+            del buf[:end + 2]
 
     def _run_capture(self):
         conn = self._get_connection()
@@ -439,28 +575,11 @@ class CameraStreamer(threading.Thread):
         resp = conn.getresponse()
 
         if resp.status == 200:
-            raw_data = resp.read()
-            img_np = np.frombuffer(raw_data, dtype=np.uint8)
-            decoded = cv2.imdecode(img_np, -1)
-
-            if decoded is not None:
-                with self.lock:
-                    self.frame = decoded
-                    self.connected = True
-                self._frame_count += 1
-
-                now = time.time()
-                if now - self._fps_timer >= 1.0:
-                    self.fps = self._frame_count / (now - self._fps_timer)
-                    self._frame_count = 0
-                    self._fps_timer = now
-            else:
-                with self.lock:
-                    self.connected = False
+            self._store_jpeg(resp.read())
         else:
             resp.read()
-            with self.lock:
-                self.connected = False
+            self._mark_disconnected(f"HTTP {resp.status} {resp.reason}")
+            time.sleep(0.5)
 
         time.sleep(0.005)
 
@@ -471,9 +590,10 @@ class CameraStreamer(threading.Thread):
                     self._run_stream()
                 else:
                     self._run_capture()
-            except Exception:
-                with self.lock:
-                    self.connected = False
+            except Exception as e:
+                if not self.running:
+                    break
+                self._mark_disconnected(f"{type(e).__name__}: {e}")
                 if self.conn:
                     try:
                         self.conn.close()
@@ -484,9 +604,24 @@ class CameraStreamer(threading.Thread):
 
     def get_latest_frame(self):
         with self.lock:
-            if self.frame is not None:
-                return self.frame.copy(), self.connected, self.fps
-            return None, self.connected, self.fps
+            jpg = self._jpeg
+            seq = self._jpeg_seq
+            connected = self.connected
+            fps = self.fps
+
+        # Decode hanya jika ada JPEG baru sejak pemanggilan terakhir
+        if jpg is not None and seq != self._decoded_seq:
+            self._decoded_seq = seq
+            decoded = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if decoded is not None:
+                self.frame = decoded
+            else:
+                # JPEG rusak satu frame bukan berarti stream putus; pakai frame sebelumnya
+                self.decode_errors += 1
+
+        if self.frame is not None:
+            return self.frame.copy(), connected, fps
+        return None, connected, fps
 
     def stop(self):
         self.running = False
@@ -841,19 +976,35 @@ def parse_args():
     )
     parser.add_argument('--cam', type=str, default='ESP32-S3', help="Nama kamera utama yang digunakan (Default: ESP32-S3)")
     parser.add_argument('--port', type=int, default=TAP_SERVER_PORT, help="Port Webhook Tap Kartu (Default: 5050)")
+    parser.add_argument(
+        '--rec-backend', choices=['auto', 'opencv', 'ort'], default='auto',
+        help="Runtime inferensi SFace:\n"
+             "  'auto'   : ONNX Runtime jika terpasang, selain itu OpenCV DNN (Default)\n"
+             "  'opencv' : OpenCV DNN\n"
+             "  'ort'    : ONNX Runtime (GPU jika ada, selain itu CPU)"
+    )
     return parser.parse_args()
 
 
 def main():
-    global CAMERAS
+    global CAMERAS, recognizer
     args = parse_args()
     raw_mode = args.mode_opt or args.mode_pos or 'stream'
     mode = 'stream' if raw_mode.lower() in ['s', 'stream'] else 'capture'
     CAMERAS = get_camera_urls(mode)
 
+    # YuNet tetap di OpenCV DNN CPU; SFace dipindah ke ONNX Runtime jika tersedia.
+    ort_recognizer = load_ort_recognizer(args.rec_backend, recognizer)
+    if ort_recognizer is not None:
+        recognizer = ort_recognizer
+        rec_label = f"ONNX Runtime ({ort_recognizer.provider})"
+    else:
+        rec_label = "OpenCV DNN (CPU)"
+
     print("=" * 65)
     print("  SISTEM VERIFIKASI 2-FACTOR (KTM NFC/RFID + FACE RECOGNITION)")
     print(f"  Mode Endpoint: {mode.upper()} ({'/stream (Port 81)' if mode == 'stream' else '/capture (Port 80)'})")
+    print(f"  Runtime AI   : YuNet OpenCV DNN (CPU) | SFace {rec_label}")
     print("=" * 65)
 
     # 1. Mulai Webhook Server Tap Kartu
@@ -881,6 +1032,9 @@ def main():
 
     try:
         while True:
+            # Timeout verifikasi & reset GUI ke standby (tidak bergantung pada frame kamera)
+            verif_manager.update()
+
             # Render frame kamera
             tiles = []
             for cam_name, streamer in streamers.items():
