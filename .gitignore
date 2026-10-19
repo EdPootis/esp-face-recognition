@@ -8,3 +8,4 @@ __pycache__
 benchmark/benchmark_video*
 benchmark/results
 benchmark/models
+face_recognition_sface_2021dec_ort.onnx

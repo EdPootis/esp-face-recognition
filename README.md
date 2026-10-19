@@ -135,6 +135,12 @@ Argumen tambahan yang tersedia:
 - `python ktm_face_verification.py capture` atau `python ktm_face_verification.py -m capture` : Menggunakan snapshot polling Keep-Alive (port 80 /capture).
 - `--cam <NAMA_KAMERA>` : Menentukan kamera utama target notifikasi LCD (default: ESP32-S3).
 - `--port <PORT>` : Menentukan port webhook receiver tap kartu (default: 5050).
+- `--rec-backend auto|opencv|ort` : Runtime inferensi SFace. `auto` (default) memakai ONNX Runtime jika paket `onnxruntime` / `onnxruntime-gpu` terpasang (GPU jika ada), selain itu OpenCV DNN. Embedding identik dengan OpenCV. Sertakan `face_recognition_sface_2021dec_ort.onnx` di folder yang sama agar ONNX Runtime lebih cepat.
+
+Untuk Jetson Nano, konfigurasi tercepat hasil benchmark adalah **YuNet di CPU + SFace via ONNX Runtime GPU** (±84 ms per frame). Pada `ktm_face_verification_optimized.py` konfigurasi ini otomatis aktif jika `onnxruntime-gpu` terpasang (YuNet tetap di CUDA hanya dengan `--det-cuda`):
+```bash
+python3 ktm_face_verification_optimized.py --headless
+```
 
 **Cara Penggunaan:**
 1. Sistem akan masuk ke status **STANDBY** (menunggu tap kartu).

@@ -91,6 +91,11 @@ detect_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_de
 recog_model_path = 'face_recognition_sface_2021dec.onnx'
 recog_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx'
 
+# Salinan SFace untuk ONNX Runtime (--rec-backend): bobot sama, tetapi initializer dihapus
+# dari daftar graph input agar ONNX Runtime bisa constant folding. Output identik dengan
+# OpenCV (selisih < 1e-5). Jika file tidak ada, file asli tetap dipakai.
+recog_model_ort_path = 'face_recognition_sface_2021dec_ort.onnx'
+
 # Unduh model jika belum ada
 for path, dl_url in [(detect_model_path, detect_model_url), (recog_model_path, recog_model_url)]:
     if not os.path.exists(path):
@@ -175,6 +180,16 @@ def init_ai_models(det_size=(DEFAULT_DET_WIDTH, DEFAULT_DET_HEIGHT), enable_cuda
     cuda_target_fp16 = getattr(cv2.dnn, 'DNN_TARGET_CUDA_FP16', None)
     cuda_target_fp32 = getattr(cv2.dnn, 'DNN_TARGET_CUDA', None)
 
+    # OpenCV dari pip punya konstanta DNN_BACKEND_CUDA walau tanpa CUDA, dan diam-diam
+    # fallback ke CPU tanpa error. Cek device CUDA dulu agar label backend tidak salah.
+    try:
+        cuda_device_count = cv2.cuda.getCudaEnabledDeviceCount()
+    except Exception:
+        cuda_device_count = 0
+    if enable_cuda and cuda_device_count == 0:
+        print("[AI ENGINE] OpenCV tidak mendeteksi device CUDA, memakai CPU.")
+        enable_cuda = False
+
     if enable_cuda and cuda_backend is not None and (cuda_target_fp32 is not None or cuda_target_fp16 is not None):
         try:
             target_cand = cuda_target_fp16 if (use_fp16 and cuda_target_fp16 is not None) else cuda_target_fp32
@@ -248,6 +263,73 @@ def init_ai_models(det_size=(DEFAULT_DET_WIDTH, DEFAULT_DET_HEIGHT), enable_cuda
         target_id=target_id
     )
     return detector, enroll_det, recog, active_device
+
+
+class SFaceORTRecognizer:
+    """
+    SFace dengan inferensi via ONNX Runtime. Antarmuka sama dengan cv2.FaceRecognizerSF:
+    alignCrop() dan match() tetap dari OpenCV, hanya feature() (inferensi model, bagian
+    terberat) yang dijalankan ONNX Runtime.
+    Hasil benchmark di Jetson Nano: recognition 185 ms (OpenCV DNN) -> 37 ms (ONNX Runtime
+    GPU) dengan embedding identik. Lihat benchmark/benchmark_01_yunet_sface.py --rec-backend ort.
+    """
+
+    def __init__(self, cv_recognizer, ort_module, providers):
+        model_path = recog_model_ort_path if os.path.exists(recog_model_ort_path) else recog_model_path
+        if model_path == recog_model_path:
+            print(f"[AI ENGINE WARN] {recog_model_ort_path} tidak ditemukan, memakai model asli "
+                  f"(ONNX Runtime lebih lambat karena tidak bisa constant folding).")
+
+        sess_options = ort_module.SessionOptions()
+        sess_options.log_severity_level = 3  # sembunyikan warning per-initializer
+        self.session = ort_module.InferenceSession(model_path, sess_options=sess_options, providers=providers)
+        self.input_name = self.session.get_inputs()[0].name
+        self.provider = self.session.get_providers()[0]
+        self.device = 'GPU' if self.provider == 'CUDAExecutionProvider' else 'CPU'
+        self._cv = cv_recognizer
+
+        # Warm-up (run pertama CUDA jauh lebih lambat karena inisialisasi kernel)
+        for _ in range(3):
+            self.feature(np.zeros((112, 112, 3), dtype=np.uint8))
+
+    def alignCrop(self, img, face):
+        return self._cv.alignCrop(img, face)
+
+    def feature(self, aligned_img):
+        # Preprocessing identik dengan FaceRecognizerSF::feature() di OpenCV
+        blob = cv2.dnn.blobFromImage(aligned_img, 1.0, (112, 112), (0, 0, 0), swapRB=True, crop=False)
+        return self.session.run(None, {self.input_name: blob})[0]
+
+    def match(self, feature1, feature2, dis_type):
+        return self._cv.match(feature1, feature2, dis_type)
+
+
+def load_ort_recognizer(rec_backend, cv_recognizer):
+    """
+    Memuat SFace via ONNX Runtime sesuai --rec-backend. Mengembalikan None jika SFace
+    tetap memakai OpenCV DNN.
+    - 'opencv': selalu OpenCV DNN.
+    - 'auto'  : ONNX Runtime jika terpasang (GPU jika ada, selain itu CPU), selain itu
+                OpenCV DNN. Di CPU laptop pun feature() ±2x lebih cepat (±7 ms vs ±15 ms);
+                di Raspberry Pi belum diuji.
+    - 'ort'   : sama dengan 'auto', tetapi memberi peringatan jika onnxruntime tidak ada.
+    """
+    if rec_backend == 'opencv':
+        return None
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        if rec_backend == 'ort':
+            print("[AI ENGINE WARN] onnxruntime belum terpasang, SFace memakai OpenCV DNN.")
+        return None
+
+    has_cuda = 'CUDAExecutionProvider' in ort.get_available_providers()
+    providers = (['CUDAExecutionProvider'] if has_cuda else []) + ['CPUExecutionProvider']
+    try:
+        return SFaceORTRecognizer(cv_recognizer, ort, providers)
+    except Exception as e:
+        print(f"[AI ENGINE WARN] ONNX Runtime gagal dimuat ({e}), SFace memakai OpenCV DNN.")
+        return None
 
 
 # ==============================================================================
@@ -1003,6 +1085,19 @@ def parse_args():
     parser.add_argument('--det-width', type=int, default=DEFAULT_DET_WIDTH, help=f"Lebar input inferensi deteksi wajah (Default: {DEFAULT_DET_WIDTH})")
     parser.add_argument('--det-height', type=int, default=DEFAULT_DET_HEIGHT, help=f"Tinggi input inferensi deteksi wajah (Default: {DEFAULT_DET_HEIGHT})")
     parser.add_argument('--headless', action='store_true', help="Jalankan mode headless tanpa GUI OpenCV (sangat direkomendasikan untuk Jetson Nano via SSH)")
+    parser.add_argument(
+        '--rec-backend', choices=['auto', 'opencv', 'ort'], default='auto',
+        help="Runtime inferensi SFace:\n"
+             "  'auto'   : ONNX Runtime jika terpasang, selain itu OpenCV DNN (Default)\n"
+             "  'opencv' : OpenCV DNN (ikut --no-cuda / CUDA seperti YuNet)\n"
+             "  'ort'    : ONNX Runtime (GPU jika ada, selain itu CPU)"
+    )
+    parser.add_argument(
+        '--det-cuda', action='store_true',
+        help="Tetap jalankan YuNet di OpenCV CUDA saat SFace memakai ONNX Runtime.\n"
+             "Default-nya YuNet di CPU, karena di Jetson Nano YuNet lebih cepat di CPU (48 ms)\n"
+             "daripada OpenCV CUDA FP16 (123 ms)."
+    )
     return parser.parse_args()
 
 
@@ -1014,26 +1109,39 @@ def main():
     CAMERAS = get_camera_urls(mode)
 
     det_size = (args.det_width, args.det_height)
-    enable_cuda = not args.no_cuda
     use_fp16 = not args.no_fp16
 
     # Deteksi otomatis mode headless jika tidak ada server X11 (misal via SSH di Linux/Jetson Nano)
     is_headless = args.headless or (sys.platform != 'win32' and os.environ.get('DISPLAY') is None)
 
+    # 1a. SFace via ONNX Runtime dipilih lebih dulu. Jika aktif, OpenCV CUDA hanya tersisa untuk
+    #     YuNet, dan di Jetson Nano YuNet justru 2.6x lebih lambat di CUDA (123 ms) daripada CPU
+    #     (48 ms) karena overhead transfer CPU<->GPU. Konfigurasi terbaik hasil benchmark:
+    #     YuNet CPU + SFace ONNX Runtime GPU (84 ms per frame). alignCrop() & match() tidak
+    #     memakai backend DNN, jadi recognizer OpenCV CPU cukup untuk keduanya.
+    ort_recognizer = load_ort_recognizer(args.rec_backend, create_face_recognizer(model_path=recog_model_path))
+    enable_cuda = not args.no_cuda and (ort_recognizer is None or args.det_cuda)
+
     print("=" * 68)
     print("  SISTEM VERIFIKASI 2-FACTOR TEROPTIMASI (KTM NFC/RFID + FACE REC)")
     print(f"  Mode Endpoint    : {mode.upper()} ({'/stream (Port 81)' if mode == 'stream' else '/capture (Port 80)'})")
     print(f"  Detection Res    : {det_size[0]}x{det_size[1]} (Downscaled Input Size)")
-    print(f"  Akselerasi CUDA  : {'Aktif (Auto/Preferred)' if enable_cuda else 'Nonaktif (Forced CPU)'}")
+    print(f"  OpenCV CUDA      : {'Aktif (Auto/Preferred)' if enable_cuda else 'Nonaktif (CPU)'}")
+    if ort_recognizer is not None:
+        print(f"  SFace Runtime    : ONNX Runtime ({ort_recognizer.provider})")
     print(f"  Mode Display     : {'HEADLESS (Tanpa GUI Display - Hemat CPU/RAM)' if is_headless else 'GUI WINDOW (OpenCV HighGUI)'}")
     print("=" * 68)
 
-    # 1. Inisialisasi Model AI (YuNet + SFace) dengan CUDA & Input Size Teroptimasi
+    # 1b. Inisialisasi Model AI (YuNet + SFace) dengan CUDA & Input Size Teroptimasi
     face_detector, enroll_detector, recognizer, active_device = init_ai_models(
         det_size=det_size,
         enable_cuda=enable_cuda,
         use_fp16=use_fp16
     )
+    if ort_recognizer is not None:
+        recognizer = ort_recognizer
+        det_device = 'CUDA' if active_device.startswith('GPU') else 'CPU'
+        active_device = f"YuNet {det_device} + SFace ORT-{ort_recognizer.device}"
 
     # 2. Mulai Webhook Server Tap Kartu
     start_tap_server(args.port)
