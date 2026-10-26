@@ -17,6 +17,50 @@ Input video berasal dari **ESP32-S3 MJPEG stream** (`http://IP:81/stream`).
 
 ---
 
+## Kombinasi Tambahan (#4 - #7): Tukar Detector & Recognizer
+
+Benchmark #4 - #7 menukar komponen antar pasangan agar terlihat pengaruh detector dan recognizer masing-masing. Semuanya memakai loop, skenario, dan metrik yang sama dengan #1 - #3 (kode bersama di `combo_pipeline.py`).
+
+| # | Script | Detector | Recognizer | Pertanyaan yang dijawab |
+|---|--------|----------|------------|-------------------------|
+| 4 | `benchmark_04_yolov5face_sface.py` | YOLOv5n-Face / YOLOv5n-0.5-Face (320x256) | SFace | Apakah detector YOLO dengan 5 landmark memperbaiki kelemahan YuNet saat miring kiri? |
+| 5 | `benchmark_05_scrfd_sface.py` | SCRFD-500M (detector #3) | SFace (recognizer #1) | Efek recognizer: bandingkan dengan #3 |
+| 6 | `benchmark_06_yunet_arcface.py` | YuNet (detector #1) | ArcFace-MBF + alignment (recognizer #2/#3) | Efek recognizer: bandingkan dengan #1 |
+| 7 | `benchmark_07_blazefacefull_arcface.py` | BlazeFace **full-range** | ArcFace-MBF + alignment | Uji ulang #2 secara adil (model jarak jauh + alignment) |
+
+Desain ringan untuk Raspberry Pi 3 dan Jetson Nano:
+- Tanpa InsightFace, MediaPipe, atau PyTorch. Cukup `opencv-python numpy pillow onnxruntime`, ditambah TFLite interpreter untuk #7 (`ai-edge-litert` di Pi, `tflite_runtime` 2.5 di Jetson).
+- Decode SCRFD dan YOLOv5-Face ditulis ulang di numpy. Hasilnya identik dengan implementasi asli (SCRFD vs InsightFace: landmark selisih 0.000 px; embedding ArcFace vs InsightFace: cosine 0.999999).
+- Thread spin-wait ONNX Runtime dimatikan agar detector dan recognizer tidak berebut core CPU.
+- Kompatibel Python 3.6 (Jetson Nano).
+
+### 1. Siapkan model (sekali, di laptop)
+
+```bash
+pip install onnx onnxruntime
+python benchmark/prepare_combo_models.py
+```
+
+Script ini mengunduh semua model (dicek SHA-256) dan mengonversi YOLOv5-Face: dipotong sebelum layer Detect, input diubah 640x640 -> 320x256 (±2.4x lebih cepat), dan opset 18 -> 13 agar bisa dimuat ONNX Runtime 1.11 di Jetson. Setelah itu salin folder `benchmark/models/` (dan `face_recognition_sface_2021dec_ort.onnx` untuk `--rec-backend ort`) ke perangkat.
+
+### 2. Jalankan
+
+```bash
+python benchmark_04_yolov5face_sface.py --video-file benchmark_video.mp4 --no-display
+python benchmark_04_yolov5face_sface.py --video-file benchmark_video.mp4 --no-display --yolo-model n-0.5   # paling ringan (Pi 3)
+python benchmark_05_scrfd_sface.py      --video-file benchmark_video.mp4 --no-display
+python benchmark_06_yunet_arcface.py    --video-file benchmark_video.mp4 --no-display
+python benchmark_07_blazefacefull_arcface.py --video-file benchmark_video.mp4 --no-display
+```
+
+Argumen tambahan: `--rec-backend opencv|ort` (SFace, #4 dan #5; di Jetson pakai `ort`), `--det-cpu` (detector di CPU walau ada CUDA), `--threads N` (thread ONNX Runtime). YuNet selalu di CPU karena di Jetson lebih cepat (48 ms) daripada OpenCV CUDA (123 ms).
+
+Catatan threshold: ArcFace-MBF memakai 0.45 (sama dengan #3). Benchmark #2 memakai 0.55 untuk model yang **sama**, jadi pakai `--threshold 0.55` di #7 bila ingin membandingkan dengan #2 pada threshold yang sama.
+
+Lisensi: YOLOv5-Face GPL-3.0; model InsightFace (SCRFD, ArcFace-MBF) hanya untuk riset non-komersial; YuNet MIT; SFace dan BlazeFace Apache-2.0.
+
+---
+
 ## Cara Menjalankan
 
 ### 1. Install Dependensi
