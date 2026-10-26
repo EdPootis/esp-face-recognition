@@ -811,7 +811,8 @@ def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_im
             req = urllib.request.Request(
                 DASHBOARD_URL,
                 data=data,
-                headers={'Content-Type': 'application/json', 'User-Agent': 'FaceRecClient'},
+                headers={'Content-Type': 'application/json', 'User-Agent': 'FaceRecClient',
+                        'X-API-Key': 'presentronik_fr_secret_key_2026'},
                 method='POST'
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
