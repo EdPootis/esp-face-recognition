@@ -28,9 +28,10 @@ if sys.platform == 'win32':
 # KONFIGURASI KAMERA & SISTEM VERIFIKASI 2FA (KTM + FACE RECOGNITION)
 # ==============================================================================
 
-# Daftar IP Address ESP32-CAM
+# Daftar IP Address ESP32-CAM. Untuk node ESP32-S3, kunci harus sama persis dengan NODE_NAME di firmware.
 CAMERA_HOSTS = {
-    'ESP32-S3': '10.7.28.33',
+    'ESP32-S3-1': '10.7.28.33',
+    'ESP32-S3-2': '10.7.28.47',
     'ESP32-CAM 1': '10.244.226.130',
     'ESP32-CAM 2': '10.244.226.31',
 }
@@ -425,6 +426,12 @@ class VerificationManager:
             clean_uid = uid.replace(" ", "").upper()
             student = student_db.get_student_by_uid(clean_uid)
 
+            # Nama dari firmware (NODE_NAME) harus sama persis dengan kunci CAMERA_HOSTS; jika tidak,
+            # tidak ada frame yang lolos verifikasi dan hasil juga tidak bisa dikirim ke LCD
+            if cam_name not in CAMERAS:
+                print(f"[TAP WARN] Kamera '{cam_name}' tidak ada di CAMERA_HOSTS {list(CAMERAS)}! "
+                      f"Verifikasi akan timeout. Samakan dengan NODE_NAME di secrets.h firmware.")
+
             self.cam_name = cam_name
             self.current_uid = clean_uid
             self.state_start_time = time.time()
@@ -501,6 +508,11 @@ class VerificationManager:
             # Timeout & reset ke IDLE ditangani update(); di sini hanya pencocokan wajah
             if self.state == VerificationState.VERIFYING:
                 if now - self.state_start_time > VERIFICATION_TIMEOUT:
+                    return
+
+                # Hanya kamera pada node tempat kartu di-tap yang boleh memverifikasi;
+                # wajah di depan node lain tidak boleh mengonfirmasi kartu ini
+                if cam_name != self.cam_name:
                     return
 
                 # Jika belum ada wajah terdeteksi pada frame ini, tunggu frame berikutnya
@@ -1184,7 +1196,7 @@ def parse_args():
         dest='mode_opt',
         help="Mode endpoint kamera: 'stream' atau 'capture' (Default: stream)"
     )
-    parser.add_argument('--cam', type=str, default='ESP32-S3', help="Nama kamera utama yang digunakan (Default: ESP32-S3)")
+    parser.add_argument('--cam', type=str, default='ESP32-S3-1', help="Nama kamera utama yang digunakan (Default: ESP32-S3-1)")
     parser.add_argument('--port', type=int, default=TAP_SERVER_PORT, help="Port Webhook Tap Kartu (Default: 5050)")
     parser.add_argument('--no-cuda', action='store_true', help="Paksa gunakan CPU (nonaktifkan CUDA GPU)")
     parser.add_argument('--no-fp16', action='store_true', help="Gunakan FP32 alih-alih FP16 saat CUDA aktif")
