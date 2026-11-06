@@ -27,6 +27,8 @@ if sys.platform == 'win32':
 # KONFIGURASI KAMERA
 # ==============================================================================
 # Daftar IP Address ESP32-CAM / ESP32-S3
+# Fallback jika dashboard (GET /api/kamera/) tidak bisa dihubungi atau belum punya kamera;
+# saat start daftar ini diganti dengan daftar kamera dari dashboard (lihat load_camera_hosts).
 CAMERA_HOSTS = {
     'ESP32-S3': '10.7.28.33',
     'ESP32-CAM 1': '10.244.226.130',
@@ -75,6 +77,32 @@ RECOGNITION_THRESHOLD = 0.363
 # Konfigurasi Dashboard Django
 DASHBOARD_URL = 'http://10.7.28.21:8000/api/log/'
 ENABLE_DASHBOARD = True
+DASHBOARD_API_KEY = 'presentronik_fr_secret_key_2026'
+# Daftar kamera aktif dikelola di dashboard (Setting Kamera); host sama dengan DASHBOARD_URL
+CAMERA_API_URL = DASHBOARD_URL.replace('/api/log/', '/api/kamera/')
+
+
+def load_camera_hosts(fallback, ruangan=None):
+    """Ambil daftar kamera dari dashboard (GET /api/kamera/); jika gagal atau kosong, pakai CAMERA_HOSTS lokal."""
+    if not ENABLE_DASHBOARD:
+        print("[DASHBOARD] Dashboard nonaktif, memakai CAMERA_HOSTS lokal.")
+        return fallback
+    url = CAMERA_API_URL
+    if ruangan:
+        url += '?' + urllib.parse.urlencode({'ruangan': ruangan})
+    try:
+        req = urllib.request.Request(url, headers={'X-API-Key': DASHBOARD_API_KEY, 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            hosts = json.loads(resp.read().decode('utf-8')).get('camera_hosts') or {}
+        if hosts:
+            print(f"[DASHBOARD] {len(hosts)} kamera dari dashboard: {hosts}")
+            return hosts
+        filter_txt = f" di ruangan '{ruangan}'" if ruangan else ""
+        print(f"[DASHBOARD WARN] Belum ada kamera aktif dengan alamat IP{filter_txt} di dashboard, "
+              f"memakai CAMERA_HOSTS lokal.")
+    except Exception as e:
+        print(f"[DASHBOARD WARN] Gagal mengambil daftar kamera dari {CAMERA_API_URL} ({e}), memakai CAMERA_HOSTS lokal.")
+    return fallback
 DASHBOARD_COOLDOWN_RECOGNIZED = 5.0
 DASHBOARD_COOLDOWN_UNKNOWN = 3.0
 
@@ -692,10 +720,13 @@ def parse_args():
     parser.add_argument('--det-width', type=int, default=DEFAULT_DET_WIDTH, help=f"Lebar input deteksi (Default: {DEFAULT_DET_WIDTH})")
     parser.add_argument('--det-height', type=int, default=DEFAULT_DET_HEIGHT, help=f"Tinggi input deteksi (Default: {DEFAULT_DET_HEIGHT})")
     parser.add_argument('--headless', action='store_true', help="Jalankan mode headless tanpa GUI OpenCV (sangat direkomendasikan untuk Jetson Nano via SSH)")
+    parser.add_argument('--ruangan', type=str, default=None,
+                        help="Hanya pakai kamera di ruangan ini dari dashboard (mis. A6.02). Default: semua kamera aktif")
     return parser.parse_args()
 
 
 def main():
+    global CAMERA_HOSTS
     args = parse_args()
     raw_mode = args.mode_opt or args.mode_pos or 'stream'
     mode = 'stream' if raw_mode.lower() in ['s', 'stream'] else 'capture'
@@ -729,6 +760,8 @@ def main():
     print(f"Total database: {len(known_faces_db)} foto dari {total_people} profil terdaftar.\n")
 
     # 3. Inisialisasi & Start Thread tiap Kamera
+    # Daftar kamera dari dashboard diambil sekali saat start
+    CAMERA_HOSTS = load_camera_hosts(CAMERA_HOSTS, args.ruangan)
     cameras = get_camera_urls(mode)
     streamers = []
     print(f"Memulai background thread untuk setiap kamera (Mode: {mode.upper()}):")

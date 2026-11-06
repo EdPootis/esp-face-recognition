@@ -24,6 +24,8 @@ if sys.platform == 'win32':
 # ==============================================================================
 
 # Daftar IP Address ESP32-CAM. Untuk node ESP32-S3, kunci harus sama persis dengan NODE_NAME di firmware.
+# Fallback jika dashboard (GET /api/kamera/) tidak bisa dihubungi atau belum punya kamera;
+# saat start daftar ini diganti dengan daftar kamera dari dashboard (lihat load_camera_hosts).
 CAMERA_HOSTS = {
     'ESP32-S3-1': '10.7.28.33',
     'ESP32-S3-2': '10.7.28.47',
@@ -67,6 +69,32 @@ TAP_SERVER_PORT = 5050
 # Konfigurasi Dashboard Django (Log Absensi)
 DASHBOARD_URL = 'http://10.7.28.21:8000/api/log/'
 ENABLE_DASHBOARD = True
+DASHBOARD_API_KEY = 'presentronik_fr_secret_key_2026'
+# Daftar kamera aktif dikelola di dashboard (Setting Kamera); host sama dengan DASHBOARD_URL
+CAMERA_API_URL = DASHBOARD_URL.replace('/api/log/', '/api/kamera/')
+
+
+def load_camera_hosts(fallback, ruangan=None):
+    """Ambil daftar kamera dari dashboard (GET /api/kamera/); jika gagal atau kosong, pakai CAMERA_HOSTS lokal."""
+    if not ENABLE_DASHBOARD:
+        print("[DASHBOARD] Dashboard nonaktif, memakai CAMERA_HOSTS lokal.")
+        return fallback
+    url = CAMERA_API_URL
+    if ruangan:
+        url += '?' + urllib.parse.urlencode({'ruangan': ruangan})
+    try:
+        req = urllib.request.Request(url, headers={'X-API-Key': DASHBOARD_API_KEY, 'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            hosts = json.loads(resp.read().decode('utf-8')).get('camera_hosts') or {}
+        if hosts:
+            print(f"[DASHBOARD] {len(hosts)} kamera dari dashboard: {hosts}")
+            return hosts
+        filter_txt = f" di ruangan '{ruangan}'" if ruangan else ""
+        print(f"[DASHBOARD WARN] Belum ada kamera aktif dengan alamat IP{filter_txt} di dashboard, "
+              f"memakai CAMERA_HOSTS lokal.")
+    except Exception as e:
+        print(f"[DASHBOARD WARN] Gagal mengambil daftar kamera dari {CAMERA_API_URL} ({e}), memakai CAMERA_HOSTS lokal.")
+    return fallback
 
 # Resolusi Tampilan Tile Kamera
 TILE_WIDTH = 640
@@ -825,7 +853,7 @@ def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_im
                 DASHBOARD_URL,
                 data=data,
                 headers={'Content-Type': 'application/json', 'User-Agent': 'FaceRecClient',
-                        'X-API-Key': 'presentronik_fr_secret_key_2026'},
+                        'X-API-Key': DASHBOARD_API_KEY},
                 method='POST'
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
@@ -1041,14 +1069,19 @@ def parse_args():
              "  'opencv' : OpenCV DNN\n"
              "  'ort'    : ONNX Runtime (GPU jika ada, selain itu CPU)"
     )
+    parser.add_argument('--ruangan', type=str, default=None,
+                        help="Hanya pakai kamera di ruangan ini dari dashboard (mis. A6.02). Default: semua kamera aktif")
     return parser.parse_args()
 
 
 def main():
-    global CAMERAS, recognizer
+    global CAMERAS, CAMERA_HOSTS, verif_managers, recognizer
     args = parse_args()
     raw_mode = args.mode_opt or args.mode_pos or 'stream'
     mode = 'stream' if raw_mode.lower() in ['s', 'stream'] else 'capture'
+    # Daftar kamera dari dashboard diambil sekali saat start, sebelum CAMERAS & verif_managers dibuat
+    CAMERA_HOSTS = load_camera_hosts(CAMERA_HOSTS, args.ruangan)
+    verif_managers = {name: VerificationManager(name) for name in CAMERA_HOSTS}
     CAMERAS = get_camera_urls(mode)
 
     # YuNet tetap di OpenCV DNN CPU; SFace dipindah ke ONNX Runtime jika tersedia.
