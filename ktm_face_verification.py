@@ -71,6 +71,7 @@ ENABLE_DASHBOARD = True
 # Resolusi Tampilan Tile Kamera
 TILE_WIDTH = 640
 TILE_HEIGHT = 480
+BANNER_HEIGHT = 110  # Banner status verifikasi di bawah setiap tile kamera
 
 # Model AI YuNet & SFace
 detect_model_path = 'face_detection_yunet_2023mar.onnx'
@@ -251,7 +252,7 @@ class VerificationManager:
     3. Mengaktifkan jendela waktu verifikasi (8 detik).
     4. Mencocokkan wajah live dengan profil pemilik kartu.
     """
-    def __init__(self):
+    def __init__(self, cam_name):
         self.state = VerificationState.IDLE
         self.current_uid = None
         self.student_info = None
@@ -260,25 +261,18 @@ class VerificationManager:
         self.result_message = ""
         self.matched_score = 0.0
         self.detected_person = None
-        self.cam_name = "ESP32-S3"
+        self.cam_name = cam_name  # Node/kamera pemilik manager ini
         # Wajah terdaftar lain yang terlihat selama VERIFYING: {folder: jumlah frame} & {folder: skor terbaik}
         self.mismatch_counts = {}
         self.mismatch_best_score = {}
         self.lock = threading.Lock()
 
-    def trigger_card_tap(self, uid, cam_name="ESP32-S3"):
-        """Dipanggil saat kartu di-tap pada Card Reader."""
+    def trigger_card_tap(self, uid):
+        """Dipanggil saat kartu di-tap pada Card Reader milik node ini."""
         with self.lock:
             clean_uid = uid.replace(" ", "").upper()
             student = student_db.get_student_by_uid(clean_uid)
 
-            # Nama dari firmware (NODE_NAME) harus sama persis dengan kunci CAMERA_HOSTS; jika tidak,
-            # tidak ada frame yang lolos verifikasi dan hasil juga tidak bisa dikirim ke LCD
-            if cam_name not in CAMERAS:
-                print(f"[TAP WARN] Kamera '{cam_name}' tidak ada di CAMERA_HOSTS {list(CAMERAS)}! "
-                      f"Verifikasi akan timeout. Samakan dengan NODE_NAME di secrets.h firmware.")
-
-            self.cam_name = cam_name
             self.current_uid = clean_uid
             self.state_start_time = time.time()
             self.matched_score = 0.0
@@ -302,7 +296,7 @@ class VerificationManager:
                 self.last_result_time = time.time()
                 self.result_message = f"KARTU TIDAK TERDAFTAR! (UID: {clean_uid})"
                 print(f"\n[TAP KTM REJECTED] UID {clean_uid} tidak terdaftar di database!")
-                send_face_to_esp32_async(CAMERAS.get(cam_name, ''), "KARTU TDK DIKENAL", 0.0, cam_name)
+                send_face_to_esp32_async(CAMERAS.get(self.cam_name, ''), "KARTU TDK DIKENAL", 0.0, self.cam_name)
 
     def update(self):
         """
@@ -356,11 +350,6 @@ class VerificationManager:
                 if now - self.state_start_time > VERIFICATION_TIMEOUT:
                     return
 
-                # Hanya kamera pada node tempat kartu di-tap yang boleh memverifikasi;
-                # wajah di depan node lain tidak boleh mengonfirmasi kartu ini
-                if cam_name != self.cam_name:
-                    return
-
                 # Jika belum ada wajah terdeteksi pada frame ini, tunggu frame berikutnya
                 if recognized_name is None:
                     return
@@ -405,7 +394,19 @@ class VerificationManager:
                     self.mismatch_best_score[recognized_name] = max(score, self.mismatch_best_score.get(recognized_name, 0.0))
 
 
-verif_manager = VerificationManager()
+# Satu VerificationManager per kamera/node, agar tap di satu node tidak menimpa verifikasi node lain
+verif_managers = {name: VerificationManager(name) for name in CAMERA_HOSTS}
+
+
+def trigger_card_tap(uid, cam_name):
+    """Meneruskan tap kartu ke VerificationManager milik node tempat kartu di-tap."""
+    manager = verif_managers.get(cam_name)
+    if manager is None:
+        # Nama dari firmware (NODE_NAME) harus sama persis dengan kunci CAMERA_HOSTS
+        print(f"[TAP WARN] Kamera '{cam_name}' tidak ada di CAMERA_HOSTS {list(verif_managers)}! "
+              f"Tap diabaikan. Samakan dengan NODE_NAME di secrets.h firmware.")
+        return
+    manager.trigger_card_tap(uid)
 
 
 # ==============================================================================
@@ -424,7 +425,7 @@ class TapWebhookHandler(BaseHTTPRequestHandler):
             cam = query.get('cam', ['ESP32-S3'])[0]
 
             if uid:
-                verif_manager.trigger_card_tap(uid, cam)
+                trigger_card_tap(uid, cam)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -445,7 +446,7 @@ class TapWebhookHandler(BaseHTTPRequestHandler):
                 uid = data.get('uid')
                 cam = data.get('cam', 'ESP32-S3')
                 if uid:
-                    verif_manager.trigger_card_tap(uid, cam)
+                    trigger_card_tap(uid, cam)
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
@@ -860,11 +861,13 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
     recognized_score_in_frame = 0.0
     recognized_rank_in_frame = -1
 
+    vm = verif_managers[cam_name]
+
     # Jika ada beberapa wajah di frame: pemilik kartu diprioritaskan, lalu wajah terdaftar
     # lain, lalu Unknown, agar wajah pemilik kartu tidak tertimpa wajah orang lain
     expected_folder = None
-    student_info = verif_manager.student_info
-    if verif_manager.state == VerificationState.VERIFYING and student_info:
+    student_info = vm.student_info
+    if vm.state == VerificationState.VERIFYING and student_info:
         expected_folder = student_info.get('folder', '').lower()
 
     if faces is not None:
@@ -901,12 +904,12 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
             dbh = int(bh * scale_y)
 
             # Warna kotak berdasarkan state verifikasi
-            state = verif_manager.state
+            state = vm.state
             if state == VerificationState.VERIFYING:
-                expected = verif_manager.student_info.get('folder', '').lower()
+                expected = vm.student_info.get('folder', '').lower()
                 if name.lower() == expected:
                     color = (0, 255, 0)      # Hijau (Cocok!)
-                    status_txt = f"{verif_manager.student_info['name']} ({score:.2f})"
+                    status_txt = f"{vm.student_info['name']} ({score:.2f})"
                 else:
                     color = (0, 165, 255)    # Orange (Memeriksa / Mismatch)
                     status_txt = f"Wajah: {name} ({score:.2f})"
@@ -925,8 +928,8 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
     # Masukkan hasil pembacaan wajah ke State Machine Verifikasi 2FA
-    if verif_manager.state == VerificationState.VERIFYING and recognized_person_in_frame is not None:
-        verif_manager.process_face_recognition(
+    if vm.state == VerificationState.VERIFYING and recognized_person_in_frame is not None:
+        vm.process_face_recognition(
             recognized_person_in_frame,
             recognized_score_in_frame,
             raw_frame,
@@ -940,37 +943,43 @@ def process_camera_frame(raw_frame, cam_name, connected, fps, known_faces_db):
     return display_frame
 
 
-def render_verification_banner(frame_width):
-    """Membuat Banner Status Verifikasi di bagian bawah jendela."""
-    banner_height = 110
-    banner = np.zeros((banner_height, frame_width, 3), dtype=np.uint8)
+def put_text_fit(img, text, org, scale, color, thickness):
+    """cv2.putText yang mengecilkan font jika teks lebih lebar dari gambar (banner per kamera lebih sempit)."""
+    max_w = img.shape[1] - org[0] - 10
+    text_w = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)[0][0]
+    if text_w > max_w:
+        scale *= max_w / text_w
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness)
 
-    state = verif_manager.state
+
+def render_verification_banner(vm, frame_width):
+    """Membuat Banner Status Verifikasi di bawah tile kamera milik VerificationManager vm."""
+    banner = np.zeros((BANNER_HEIGHT, frame_width, 3), dtype=np.uint8)
+
+    state = vm.state
     now = time.time()
+    cam_tag = f"[{vm.cam_name}]"
 
     if state == VerificationState.IDLE:
         banner[:] = (45, 30, 20)  # Biru Gelap
-        cv2.putText(banner, "STATUS: STANDBY", (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(banner, ">> SILAKAN TEMPELKAN KARTU TANDA MAHASISWA (KTM) PADA CARD READER <<",
-                    (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 230, 255), 2)
+        put_text_fit(banner, f"{cam_tag} STATUS: STANDBY", (20, 35), 0.8, (255, 255, 255), 2)
+        put_text_fit(banner, ">> SILAKAN TEMPELKAN KTM PADA CARD READER <<", (20, 75), 0.6, (0, 230, 255), 2)
 
     elif state == VerificationState.VERIFYING:
         banner[:] = (20, 45, 60)  # Kuning / Oranye Gelap
-        time_left = max(0.0, VERIFICATION_TIMEOUT - (now - verif_manager.state_start_time))
-        student = verif_manager.student_info
+        time_left = max(0.0, VERIFICATION_TIMEOUT - (now - vm.state_start_time))
+        student = vm.student_info
 
-        cv2.putText(banner, f"STATUS: MEMERIKSA WAJAH (Sisa Waktu: {time_left:.1f}s)", (20, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2)
-        cv2.putText(banner, f"Mahasiswa: {student['name']} | NIM: {student['nim']} | Jurusan: {student.get('major', '-')}",
-                    (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        others = list(verif_manager.mismatch_counts)
+        put_text_fit(banner, f"{cam_tag} MEMERIKSA WAJAH (Sisa Waktu: {time_left:.1f}s)", (20, 32),
+                     0.75, (0, 255, 255), 2)
+        put_text_fit(banner, f"Mahasiswa: {student['name']} | NIM: {student['nim']} | Jurusan: {student.get('major', '-')}",
+                     (20, 65), 0.6, (255, 255, 255), 2)
+        others = list(vm.mismatch_counts)
         if others:
             hint = f"Wajah lain terdeteksi: {', '.join(others)} | Tetap menunggu wajah {student['name']}..."
         else:
             hint = "Silakan pandang lurus ke lensa kamera..."
-        cv2.putText(banner, hint, (20, 95),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 230, 255), 1)
+        put_text_fit(banner, hint, (20, 95), 0.55, (180, 230, 255), 1)
 
         # Progress bar countdown
         bar_w = int((time_left / VERIFICATION_TIMEOUT) * (frame_width - 40))
@@ -978,31 +987,25 @@ def render_verification_banner(frame_width):
 
     elif state == VerificationState.SUCCESS:
         banner[:] = (20, 60, 20)  # Hijau
-        cv2.putText(banner, "✓ VERIFIKASI BERHASIL! (AKSES DITERIMA)", (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2)
-        cv2.putText(banner, verif_manager.result_message, (20, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+        put_text_fit(banner, f"{cam_tag} VERIFIKASI BERHASIL! (AKSES DITERIMA)", (20, 35), 0.85, (0, 255, 0), 2)
+        put_text_fit(banner, vm.result_message, (20, 75), 0.65, (255, 255, 255), 2)
 
     elif state == VerificationState.REJECTED_MISMATCH:
         banner[:] = (20, 20, 70)  # Merah
-        cv2.putText(banner, "🚨 KECURANGAN TERDETEKSI: WAJAH TIDAK COCOK! (AKSES DITOLAK)", (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
-        cv2.putText(banner, verif_manager.result_message, (20, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        put_text_fit(banner, f"{cam_tag} KECURANGAN: WAJAH TIDAK COCOK! (AKSES DITOLAK)", (20, 35),
+                     0.75, (0, 0, 255), 2)
+        put_text_fit(banner, vm.result_message, (20, 75), 0.6, (255, 255, 255), 2)
 
     elif state == VerificationState.REJECTED_UNKNOWN:
         banner[:] = (20, 20, 70)  # Merah
-        cv2.putText(banner, "❌ KARTU TIDAK TERDAFTAR!", (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2)
-        cv2.putText(banner, verif_manager.result_message, (20, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 2)
+        put_text_fit(banner, f"{cam_tag} KARTU TIDAK TERDAFTAR!", (20, 35), 0.85, (0, 0, 255), 2)
+        put_text_fit(banner, vm.result_message, (20, 75), 0.6, (200, 200, 255), 2)
 
     elif state == VerificationState.TIMEOUT_NO_FACE:
         banner[:] = (20, 40, 70)  # Oranye / Merah
-        cv2.putText(banner, "⏱️ VERIFIKASI GAGAL: WAKTU HABIS (TIMEOUT)", (20, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
-        cv2.putText(banner, "Tidak ada wajah yang cocok dalam 8 detik. Silakan tap kartu kembali.",
-                    (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+        put_text_fit(banner, f"{cam_tag} VERIFIKASI GAGAL: WAKTU HABIS (TIMEOUT)", (20, 35), 0.8, (0, 165, 255), 2)
+        put_text_fit(banner, f"Tidak ada wajah yang cocok dalam {VERIFICATION_TIMEOUT:.0f} detik. Silakan tap kartu kembali.",
+                     (20, 75), 0.6, (255, 255, 255), 1)
 
     return banner
 
@@ -1029,7 +1032,7 @@ def parse_args():
         dest='mode_opt',
         help="Mode endpoint kamera: 'stream' atau 'capture' (Default: stream)"
     )
-    parser.add_argument('--cam', type=str, default='ESP32-S3-1', help="Nama kamera utama yang digunakan (Default: ESP32-S3-1)")
+    parser.add_argument('--cam', type=str, default='ESP32-S3-1', help="Kamera tujuan simulasi tap kartu (tombol 't') (Default: ESP32-S3-1)")
     parser.add_argument('--port', type=int, default=TAP_SERVER_PORT, help="Port Webhook Tap Kartu (Default: 5050)")
     parser.add_argument(
         '--rec-backend', choices=['auto', 'opencv', 'ort'], default='auto',
@@ -1088,14 +1091,16 @@ def main():
     try:
         while True:
             # Timeout verifikasi & reset GUI ke standby (tidak bergantung pada frame kamera)
-            verif_manager.update()
+            for vm in verif_managers.values():
+                vm.update()
 
             # Render frame kamera
             tiles = []
             for cam_name, streamer in streamers.items():
                 frame, connected, fps = streamer.get_latest_frame()
                 tile = process_camera_frame(frame, cam_name, connected, fps, known_faces_db)
-                tiles.append(tile)
+                # Status verifikasi ditampilkan di bawah tile kamera masing-masing
+                tiles.append(np.vstack([tile, render_verification_banner(verif_managers[cam_name], TILE_WIDTH)]))
 
             # Buat grid kamera
             if len(tiles) == 1:
@@ -1106,18 +1111,14 @@ def main():
                 top_row = np.hstack(tiles[:2])
                 bottom_tiles = tiles[2:]
                 while len(bottom_tiles) < 2:
-                    blank = np.zeros((TILE_HEIGHT, TILE_WIDTH, 3), dtype=np.uint8)
+                    blank = np.zeros((TILE_HEIGHT + BANNER_HEIGHT, TILE_WIDTH, 3), dtype=np.uint8)
                     bottom_tiles.append(blank)
                 bottom_row = np.hstack(bottom_tiles)
                 camera_grid = np.vstack([top_row, bottom_row])
             else:
                 camera_grid = tiles[0]
 
-            # Render Status Banner di bagian bawah
-            banner = render_verification_banner(camera_grid.shape[1])
-            final_display = np.vstack([camera_grid, banner])
-
-            cv2.imshow(window_name, final_display)
+            cv2.imshow(window_name, camera_grid)
 
             # Handle Keyboard Input
             key = cv2.waitKey(10) & 0xFF
@@ -1130,7 +1131,7 @@ def main():
                 if sample_uids:
                     simulated_uid = sample_uids[0]
                     print(f"\n[SIMULASI] Men-tap kartu contoh: UID '{simulated_uid}' ({student_db.students[simulated_uid]['name']})")
-                    verif_manager.trigger_card_tap(simulated_uid, args.cam)
+                    trigger_card_tap(simulated_uid, args.cam)
 
     finally:
         for streamer in streamers.values():
