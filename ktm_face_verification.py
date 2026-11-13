@@ -290,18 +290,21 @@ class VerificationManager:
         self.matched_score = 0.0
         self.detected_person = None
         self.cam_name = cam_name  # Node/kamera pemilik manager ini
+        self.mac_address = None   # MAC board dari /tap (firmware); None jika firmware lama tidak mengirimnya
         # Wajah terdaftar lain yang terlihat selama VERIFYING: {folder: jumlah frame} & {folder: skor terbaik}
         self.mismatch_counts = {}
         self.mismatch_best_score = {}
         self.lock = threading.Lock()
 
-    def trigger_card_tap(self, uid):
+    def trigger_card_tap(self, uid, mac=None):
         """Dipanggil saat kartu di-tap pada Card Reader milik node ini."""
         with self.lock:
             clean_uid = uid.replace(" ", "").upper()
             student = student_db.get_student_by_uid(clean_uid)
 
             self.current_uid = clean_uid
+            if mac:
+                self.mac_address = mac
             self.state_start_time = time.time()
             self.matched_score = 0.0
             self.detected_person = None
@@ -403,6 +406,7 @@ class VerificationManager:
                         face_image=raw_frame,
                         nim=self.student_info.get('nim', '-'),
                         uid=self.current_uid,
+                        mac_address=self.mac_address,
                         kd_org=self.student_info.get('kd_org', self.student_info.get('major', '01.00.12.01')),
                         status='HADIR'
                     )
@@ -426,7 +430,7 @@ class VerificationManager:
 verif_managers = {name: VerificationManager(name) for name in CAMERA_HOSTS}
 
 
-def trigger_card_tap(uid, cam_name):
+def trigger_card_tap(uid, cam_name, mac=None):
     """Meneruskan tap kartu ke VerificationManager milik node tempat kartu di-tap."""
     manager = verif_managers.get(cam_name)
     if manager is None:
@@ -434,7 +438,7 @@ def trigger_card_tap(uid, cam_name):
         print(f"[TAP WARN] Kamera '{cam_name}' tidak ada di CAMERA_HOSTS {list(verif_managers)}! "
               f"Tap diabaikan. Samakan dengan NODE_NAME di secrets.h firmware.")
         return
-    manager.trigger_card_tap(uid)
+    manager.trigger_card_tap(uid, mac)
 
 
 # ==============================================================================
@@ -443,7 +447,7 @@ def trigger_card_tap(uid, cam_name):
 class TapWebhookHandler(BaseHTTPRequestHandler):
     """
     Server HTTP lokal agar ESP32 dapat mengirim data tap kartu secara langsung:
-    Contoh: GET http://[IP_KOMPUTER]:5050/tap?uid=DEA35B89&cam=ESP32-S3
+    Contoh: GET http://[IP_KOMPUTER]:5050/tap?uid=DEA35B89&cam=ESP32-S3-1&mac=24:6F:28:AB:CD:EF
     """
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
@@ -451,9 +455,10 @@ class TapWebhookHandler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed_url.query)
             uid = query.get('uid', [None])[0]
             cam = query.get('cam', ['ESP32-S3'])[0]
+            mac = query.get('mac', [None])[0]
 
             if uid:
-                trigger_card_tap(uid, cam)
+                trigger_card_tap(uid, cam, mac)
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
@@ -473,8 +478,9 @@ class TapWebhookHandler(BaseHTTPRequestHandler):
                 data = json.loads(post_data.decode('utf-8'))
                 uid = data.get('uid')
                 cam = data.get('cam', 'ESP32-S3')
+                mac = data.get('mac')
                 if uid:
-                    trigger_card_tap(uid, cam)
+                    trigger_card_tap(uid, cam, mac)
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json')
                     self.end_headers()
@@ -804,7 +810,7 @@ def send_face_to_esp32_async(cam_url, name, score, cam_name):
     threading.Thread(target=_worker, daemon=True).start()
 
 
-def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_image=None, nim="-", uid="-", kd_org="01.00.12.01", status="HADIR"):
+def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_image=None, nim="-", uid="-", kd_org="01.00.12.01", status="HADIR", mac_address=None):
     """
     Mengirim log kehadiran ke Django Dashboard API sesuai skema model LogPresentronik.
     """
@@ -821,14 +827,12 @@ def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_im
                     foto_b64 = f"data:image/jpeg;base64,{raw_b64}"
 
             now_dt = datetime.now()
-            mac_addr = CAMERA_HOSTS.get(cam_name, '00:00:00:00:00:00')
 
             payload = {
                 # Format Standar Model LogPresentronik
                 'no_identitas': nim if nim else '-',
                 'nama': person_name,
                 'rfid_tag': uid if uid else '-',
-                'mac_address': mac_addr,
                 'kd_org': kd_org if kd_org else '01.00.12.01',
                 'tipe_perangkat': 'ESP32-S3 Face Recognition',
                 'ts_presensi_device': now_dt.strftime('%Y-%m-%d %H:%M:%S'),
@@ -847,6 +851,9 @@ def send_log_to_dashboard(cam_name, person_name, similarity, recognized, face_im
                 'timestamp': now_dt.isoformat(),
                 'image_base64': foto_b64
             }
+            # MAC asli dari firmware; tanpa MAC, dashboard memakai MAC kamera dari Setting Kamera
+            if mac_address:
+                payload['mac_address'] = mac_address
 
             data = json.dumps(payload).encode('utf-8')
             req = urllib.request.Request(

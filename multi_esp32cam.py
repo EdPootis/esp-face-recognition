@@ -443,7 +443,6 @@ def send_log_to_dashboard_async(dashboard_url, cam_name, name, score, face_statu
         try:
             foto_b64 = encode_image_to_b64(face_crop)
             now_dt = datetime.now()
-            mac_addr = CAMERA_HOSTS.get(cam_name, '00:00:00:00:00:00')
 
             st_info = _student_cache.get(name.lower(), {})
             nim = st_info.get('nim', '-')
@@ -456,7 +455,6 @@ def send_log_to_dashboard_async(dashboard_url, cam_name, name, score, face_statu
                 'no_identitas': nim,
                 'nama': full_name,
                 'rfid_tag': uid,
-                'mac_address': mac_addr,
                 'kd_org': kd_org,
                 'tipe_perangkat': 'ESP32-CAM Face Recognition',
                 'ts_presensi_device': now_dt.strftime('%Y-%m-%d %H:%M:%S'),
