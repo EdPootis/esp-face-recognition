@@ -12,3 +12,6 @@ face_recognition_sface_2021dec_ort.onnx
 
 # Foto presensi mode KTM + Foto (ktm_presensi_foto.py), berisi wajah mahasiswa
 foto_presensi/
+
+# Antrian log presensi yang belum terkirim ke dashboard (berisi foto & data mahasiswa)
+antrian_log/

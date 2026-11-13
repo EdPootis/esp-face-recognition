@@ -10,7 +10,8 @@ Alur per tap (firmware ktm_foto_s3 -> GET /tap?uid=..&cam=..&mac=..):
   2. Ambil foto JPEG dari http://<ip-kamera>/capture.
   3. Simpan foto di FOTO_DIR (cadangan lokal).
   4. Kirim nama ke LCD ESP32 (/face).
-  5. Kirim log presensi + foto ke dashboard (POST /api/log/).
+  5. Kirim log presensi + foto ke dashboard (POST /api/log/). Jika gagal, log disimpan di QUEUE_DIR
+     dan dikirim ulang di latar dengan ts_presensi_device asli.
 
 GUI menampilkan satu tile per kamera: foto tap terakhir (atau alasan foto tidak ada) dan status
 LCD & dashboard. GUI butuh OpenCV; dengan --headless, atau tanpa OpenCV/DISPLAY, skrip hanya memakai
@@ -74,7 +75,14 @@ SAVE_LOCAL_PHOTOS = True
 FOTO_DIR = 'foto_presensi'
 
 # Pesan LCD (maks 16 karakter, baris 2) untuk kartu yang tidak ada di database
-LCD_UNKNOWN_CARD = 'KTM TDK DIKENAL'
+# Pesan LCD untuk kartu yang tidak ada di database lokal. Sengaja netral: dashboard tetap mencatat
+# kehadiran jika kartu ada di data kartu SIAK, jadi "tidak dikenal" di sini belum tentu ditolak.
+LCD_UNKNOWN_CARD = 'KTM Tercatat'
+
+# Log yang gagal terkirim (dashboard mati / jaringan putus) disimpan di sini lalu dikirim ulang dengan
+# ts_presensi_device asli. Duplikat aman: dashboard tetap menghitung kehadiran sekali per kelas.
+QUEUE_DIR = 'antrian_log'
+QUEUE_RETRY_INTERVAL = 30.0
 
 # Konfigurasi Dashboard Django (Log Absensi)
 DASHBOARD_URL = 'http://10.7.28.21:8000/api/log/'
@@ -224,11 +232,13 @@ def send_result_to_lcd(host, text, cam_name, tap_time):
 def send_log_to_dashboard(cam_name, student, uid, jpeg, tap_time, mac_address=None):
     """
     Mengirim log presensi ke Django Dashboard API (skema LogPresentronik, sama dengan skrip face recognition).
-    Kartu terdaftar -> status HADIR (masuk log_presentronik & sinkron SIAK); kartu tidak dikenal -> status
-    Unknown (hanya log_absensi dashboard). Foto ikut dikirim jika ada. Mengembalikan ringkasan hasil untuk GUI.
+    Kartu terdaftar -> status HADIR (masuk log_presentronik & sinkron SIAK). Kartu yang tidak ada di database
+    lokal -> status Unknown; dashboard tetap mencatat kehadiran jika UID ada di data kartu SIAK.
+    Foto ikut dikirim jika ada. Jika gagal terkirim, log diantrekan untuk dikirim ulang.
+    Mengembalikan (ringkasan hasil untuk GUI, nama file antrian atau None).
     """
     if not ENABLE_DASHBOARD:
-        return "NONAKTIF"
+        return "NONAKTIF", None
 
     known = student is not None
     nim = student.get('nim', '-') if known else '-'
@@ -264,21 +274,123 @@ def send_log_to_dashboard(cam_name, student, uid, jpeg, tap_time, mac_address=No
         payload['mac_address'] = mac_address
 
     try:
-        req = urllib.request.Request(
-            DASHBOARD_URL,
-            data=json.dumps(payload).encode('utf-8'),
-            headers={'Content-Type': 'application/json', 'User-Agent': 'PresensiFotoClient',
-                     'X-API-Key': DASHBOARD_API_KEY},
-            method='POST'
-        )
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
-            code = resp.getcode()
+        code = post_log(payload)
         print(f"[DASHBOARD] Log presensi terkirim ({code}) -> {name} ({nim}) | UID: {uid} | "
               f"Foto: {'ada' if jpeg else 'TIDAK ADA'}")
-        return f"OK ({code})"
+        return f"OK ({code})", None
     except Exception as e:
-        print(f"[DASHBOARD ERROR] Gagal mengirim log ({cam_name} / {name} / UID {uid}): {e}")
-        return f"GAGAL: {type(e).__name__}: {getattr(e, 'reason', e)}"
+        reason = describe_error(e)
+        if is_permanent_error(e):
+            print(f"[DASHBOARD ERROR] Log ditolak dashboard ({cam_name} / {name} / UID {uid}): {reason}. "
+                  f"Tidak diantrekan karena pengiriman ulang tidak akan berhasil.")
+            return f"DITOLAK: {reason}", None
+        queue_file = enqueue_log(payload)
+        if queue_file is None:
+            return f"GAGAL (antrian juga gagal): {reason}", None
+        print(f"[DASHBOARD ERROR] Gagal mengirim log ({cam_name} / {name} / UID {uid}): {reason}. "
+              f"Diantrekan untuk dikirim ulang: {queue_file}")
+        return f"GAGAL, diantrekan: {reason}", queue_file
+
+
+# ==============================================================================
+# ANTRIAN LOG GAGAL KIRIM (DIKIRIM ULANG DENGAN ts_presensi_device ASLI)
+# ==============================================================================
+def post_log(payload):
+    """POST satu log ke dashboard. Mengembalikan HTTP status code; melempar exception jika gagal."""
+    req = urllib.request.Request(
+        DASHBOARD_URL,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={'Content-Type': 'application/json', 'User-Agent': 'PresensiFotoClient',
+                 'X-API-Key': DASHBOARD_API_KEY},
+        method='POST'
+    )
+    with urllib.request.urlopen(req, timeout=5.0) as resp:
+        return resp.getcode()
+
+
+def describe_error(e):
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code} {e.reason}"
+    return f"{type(e).__name__}: {getattr(e, 'reason', e)}"
+
+
+def is_permanent_error(e):
+    """Payload ditolak dashboard dan tidak akan berhasil walau dikirim ulang. Kegagalan lain diantrekan,
+    termasuk 401 (API key bisa diperbaiki lalu skrip di-restart)."""
+    return isinstance(e, urllib.error.HTTPError) and e.code in (400, 413, 422)
+
+
+def enqueue_log(payload):
+    """Simpan log yang gagal terkirim ke QUEUE_DIR. Mengembalikan nama file antrian, atau None jika gagal."""
+    try:
+        os.makedirs(QUEUE_DIR, exist_ok=True)
+        label = re.sub(r'[^A-Za-z0-9_.-]+', '_', f"{payload.get('kamera', '-')}_{payload.get('rfid_tag', '-')}")
+        name = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{label}.json"
+        tmp_path = os.path.join(QUEUE_DIR, name + '.tmp')
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        # Ditulis utuh ke .tmp dulu agar thread pengirim ulang tidak membaca file setengah jadi
+        os.replace(tmp_path, os.path.join(QUEUE_DIR, name))
+        return name
+    except Exception as e:
+        print(f"[ANTRIAN ERROR] Gagal menyimpan log ke antrian {QUEUE_DIR}: {e}")
+        return None
+
+
+def pending_log_files():
+    """Nama file antrian yang belum terkirim, terlama dulu."""
+    if not os.path.isdir(QUEUE_DIR):
+        return []
+    return sorted(f for f in os.listdir(QUEUE_DIR) if f.endswith('.json'))
+
+
+def move_to_rejected(name):
+    rejected_dir = os.path.join(QUEUE_DIR, 'ditolak')
+    os.makedirs(rejected_dir, exist_ok=True)
+    os.replace(os.path.join(QUEUE_DIR, name), os.path.join(rejected_dir, name))
+
+
+def resend_queued_logs():
+    """Kirim ulang log di antrian, terlama dulu. Berhenti di kegagalan pertama (dashboard masih belum bisa
+    dihubungi). Mengembalikan jumlah log yang berhasil dikirim ulang."""
+    sent = 0
+    for name in pending_log_files():
+        try:
+            with open(os.path.join(QUEUE_DIR, name), encoding='utf-8') as f:
+                payload = json.load(f)
+        except Exception as e:
+            print(f"[ANTRIAN WARN] File antrian rusak ({e}), dipindah ke {QUEUE_DIR}/ditolak/: {name}")
+            move_to_rejected(name)
+            continue
+        try:
+            code = post_log(payload)
+        except Exception as e:
+            if is_permanent_error(e):
+                print(f"[ANTRIAN ERROR] Log ditolak dashboard ({describe_error(e)}), dipindah ke "
+                      f"{QUEUE_DIR}/ditolak/: {name}")
+                move_to_rejected(name)
+                continue
+            break
+        os.remove(os.path.join(QUEUE_DIR, name))
+        sent += 1
+        print(f"[ANTRIAN] Log dikirim ulang ({code}) -> {payload.get('nama')} | UID: {payload.get('rfid_tag')} | "
+              f"waktu tap {payload.get('ts_presensi_device')}")
+        # Tile GUI kamera itu ikut diperbarui jika masih menampilkan tap yang sama
+        with tap_results_lock:
+            result = tap_results.get(payload.get('kamera'))
+            if result and result.get('queue_file') == name:
+                result['dashboard'] = f"OK ({code}, dikirim ulang)"
+    return sent
+
+
+def queue_worker():
+    """Thread latar: kirim ulang antrian saat start, lalu tiap QUEUE_RETRY_INTERVAL detik."""
+    while True:
+        try:
+            resend_queued_logs()
+        except Exception as e:
+            print(f"[ANTRIAN WARN] Gagal memproses antrian: {e}")
+        time.sleep(QUEUE_RETRY_INTERVAL)
 
 
 def process_tap(uid, cam_name, mac=None):
@@ -299,7 +411,8 @@ def process_tap(uid, cam_name, mac=None):
     if student:
         print(f"\n[TAP KTM] {cam_name} | UID: {clean_uid} -> {student.get('name')} ({student.get('nim')})")
     else:
-        print(f"\n[TAP KTM] {cam_name} | UID: {clean_uid} -> KARTU TIDAK TERDAFTAR")
+        print(f"\n[TAP KTM] {cam_name} | UID: {clean_uid} -> TIDAK ADA DI DATABASE LOKAL "
+              f"(dashboard akan mencocokkan ke data kartu SIAK)")
 
     jpeg = None
     if host is None:
@@ -328,8 +441,9 @@ def process_tap(uid, cam_name, mac=None):
             print(f"[FOTO] Tersimpan: {path} ({len(jpeg) // 1024} KB)")
 
     update_tap_result(cam_name, dashboard='Mengirim...')
-    dashboard_result = send_log_to_dashboard(cam_name, student, clean_uid, jpeg, tap_time, camera_macs.get(cam_name))
-    update_tap_result(cam_name, dashboard=dashboard_result)
+    dashboard_result, queue_file = send_log_to_dashboard(cam_name, student, clean_uid, jpeg, tap_time,
+                                                         camera_macs.get(cam_name))
+    update_tap_result(cam_name, dashboard=dashboard_result, queue_file=queue_file)
 
 
 def trigger_card_tap(uid, cam_name, mac=None):
@@ -458,9 +572,10 @@ def render_tile(cam_name, result, photo_cache):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
     student = result.get('student')
-    banner[:] = (20, 60, 20) if student else (20, 20, 70)
-    status = "HADIR" if student else "KARTU TIDAK TERDAFTAR"
-    who = f"{student.get('name', '-')} ({student.get('nim', '-')})" if student else "Unknown"
+    # Kartu di luar database lokal: oranye, bukan merah, karena dashboard masih mencocokkannya ke data kartu SIAK
+    banner[:] = (20, 60, 20) if student else (20, 70, 110)
+    status = "HADIR" if student else "TIDAK ADA DI DATABASE LOKAL"
+    who = f"{student.get('name', '-')} ({student.get('nim', '-')})" if student else "Dicocokkan dashboard ke data SIAK"
     put_text_fit(banner, f"[{cam_name}] {result['time'].strftime('%H:%M:%S')}  {status}", (20, 30),
                  0.75, (255, 255, 255), 2)
     put_text_fit(banner, f"{who} | UID: {result['uid']}", (20, 60), 0.6, (255, 255, 255), 1)
@@ -496,7 +611,12 @@ def run_gui(server, sim_cam):
             # Kamera dari CAMERA_HOSTS, ditambah kamera tak dikenal yang pernah mengirim tap (agar salah nama terlihat)
             cams = list(CAMERA_HOSTS) + [c for c in snapshot if c not in CAMERA_HOSTS]
             tiles = [render_tile(cam, snapshot.get(cam), photo_cache) for cam in (cams or ['-'])]
-            cv2.imshow(window_name, build_grid(tiles))
+            grid = build_grid(tiles)
+            pending = len(pending_log_files()) if ENABLE_DASHBOARD else 0
+            if pending:
+                cv2.putText(grid, f"Antrian log belum terkirim: {pending}", (grid.shape[1] - 330, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (80, 80, 255), 2)
+            cv2.imshow(window_name, grid)
 
             key = cv2.waitKey(100) & 0xFF
             if key == ord('q') or key == 27:
@@ -553,6 +673,12 @@ def main():
     # Daftar kamera dari dashboard diambil sekali saat start
     CAMERA_HOSTS = load_camera_hosts(CAMERA_HOSTS, args.ruangan)
     print(f"Total Database: {len(student_db.students)} KTM terdaftar.")
+
+    if ENABLE_DASHBOARD:
+        pending = len(pending_log_files())
+        if pending:
+            print(f"[ANTRIAN] {pending} log belum terkirim dari sesi sebelumnya, dikirim ulang di latar.")
+        threading.Thread(target=queue_worker, daemon=True).start()
 
     try:
         server = HTTPServer(('0.0.0.0', args.port), TapWebhookHandler)
