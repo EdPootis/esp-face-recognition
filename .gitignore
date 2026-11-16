@@ -15,3 +15,6 @@ foto_presensi/
 
 # Antrian log presensi yang belum terkirim ke dashboard (berisi foto & data mahasiswa)
 antrian_log/
+
+# Model SCRFD-500M (InsightFace buffalo_sc det_500m), diunduh otomatis oleh scrfd_detector.py
+scrfd_500m.onnx

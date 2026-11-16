@@ -135,9 +135,10 @@ Argumen tambahan yang tersedia:
 - `python ktm_face_verification.py capture` atau `python ktm_face_verification.py -m capture` : Menggunakan snapshot polling Keep-Alive (port 80 /capture).
 - `--cam <NAMA_KAMERA>` : Menentukan kamera utama target notifikasi LCD (default: ESP32-S3).
 - `--port <PORT>` : Menentukan port webhook receiver tap kartu (default: 5050).
+- `--detector scrfd|yunet` : Detector wajah. Default `scrfd` (SCRFD-500M via ONNX Runtime, lihat `scrfd_detector.py`): lebih akurat daripada YuNet saat kepala miring, jarak jauh, dan cahaya redup (benchmark 23 Oktober 2026). Model diunduh otomatis dari rilis InsightFace jika belum ada. Butuh paket `onnxruntime`; tanpa itu skrip kembali ke YuNet. Catatan: model InsightFace dirilis untuk riset non-komersial.
 - `--rec-backend auto|opencv|ort` : Runtime inferensi SFace. `auto` (default) memakai ONNX Runtime jika paket `onnxruntime` / `onnxruntime-gpu` terpasang (GPU jika ada), selain itu OpenCV DNN. Embedding identik dengan OpenCV. Sertakan `face_recognition_sface_2021dec_ort.onnx` di folder yang sama agar ONNX Runtime lebih cepat.
 
-Untuk Jetson Nano, konfigurasi tercepat hasil benchmark adalah **YuNet di CPU + SFace via ONNX Runtime GPU** (±84 ms per frame). Pada `ktm_face_verification_optimized.py` konfigurasi ini otomatis aktif jika `onnxruntime-gpu` terpasang (YuNet tetap di CUDA hanya dengan `--det-cuda`):
+Untuk Jetson Nano, konfigurasi default **SCRFD + SFace, keduanya via ONNX Runtime GPU** (±65 ms per frame di benchmark) otomatis aktif jika `onnxruntime-gpu` terpasang. Dengan `--detector yunet`, konfigurasi tercepatnya YuNet di CPU + SFace ONNX Runtime GPU (±84 ms; YuNet di CUDA hanya dengan `--det-cuda`):
 ```bash
 python3 ktm_face_verification_optimized.py --headless
 ```

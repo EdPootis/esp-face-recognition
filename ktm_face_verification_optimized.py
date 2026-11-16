@@ -16,6 +16,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
+from scrfd_detector import load_scrfd_detector
+
 if sys.platform == 'win32':
     import msvcrt
     try:
@@ -109,8 +111,10 @@ BANNER_HEIGHT = 110  # Banner status verifikasi di bawah setiap tile kamera
 # ==============================================================================
 # KONFIGURASI OPTIMASI (CUDA BACKEND & DOWNSCALED INPUT SIZE)
 # ==============================================================================
-# Resolusi input inferensi YuNet (Default 320x240)
-# Memberikan ~4x hingga 5x speedup dibandingkan 800x600/640x480 penuh
+# Resolusi input inferensi detector wajah (Default 320x240; SCRFD membulatkannya ke 320x224)
+# Memberikan ~4x hingga 5x speedup dibandingkan 800x600/640x480 penuh.
+# Detector default SCRFD-500M (dimuat di main(), lihat scrfd_detector.py); model YuNet di bawah
+# dipakai dengan --detector yunet atau sebagai cadangan jika SCRFD/onnxruntime tidak tersedia.
 DEFAULT_DET_WIDTH = 320
 DEFAULT_DET_HEIGHT = 240
 
@@ -1256,6 +1260,14 @@ def parse_args():
     )
     parser.add_argument('--ruangan', type=str, default=None,
                         help="Hanya pakai kamera di ruangan ini dari dashboard (mis. A6.02). Default: semua kamera aktif")
+    parser.add_argument(
+        '--detector', choices=['scrfd', 'yunet'], default='scrfd',
+        help="Detector wajah:\n"
+             "  'scrfd' : SCRFD-500M via ONNX Runtime, GPU jika ada (Default). Hasil benchmark lebih akurat\n"
+             "            saat kepala miring, jarak jauh, dan cahaya redup, dan lebih cepat di Jetson\n"
+             "            (65 vs 84 ms per frame). Kembali ke YuNet jika onnxruntime tidak ada.\n"
+             "  'yunet' : YuNet via OpenCV DNN (CPU, atau CUDA dengan --det-cuda)"
+    )
     return parser.parse_args()
 
 
@@ -1303,6 +1315,15 @@ def main():
         recognizer = ort_recognizer
         det_device = 'CUDA' if active_device.startswith('GPU') else 'CPU'
         active_device = f"YuNet {det_device} + SFace ORT-{ort_recognizer.device}"
+
+    # 1c. Detector: SCRFD-500M (default) menggantikan YuNet untuk live & enrollment, konfigurasi sama
+    #     dengan benchmark #5 (input 320x224, skor 0.5; enrollment 0.3). YuNet tetap jadi cadangan.
+    if args.detector == 'scrfd':
+        scrfd = load_scrfd_detector(use_cuda=not args.no_cuda)
+        if scrfd is not None:
+            face_detector, enroll_detector = scrfd, scrfd.with_threshold(0.3)
+            sface_label = f"ORT-{ort_recognizer.device}" if ort_recognizer is not None else active_device
+            active_device = f"SCRFD ORT-{scrfd.device} + SFace {sface_label}"
 
     # 2. Mulai Webhook Server Tap Kartu
     start_tap_server(args.port)

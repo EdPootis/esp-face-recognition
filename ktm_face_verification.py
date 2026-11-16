@@ -16,6 +16,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
+from scrfd_detector import load_scrfd_detector
+
 if sys.platform == 'win32':
     import msvcrt
 
@@ -101,7 +103,8 @@ TILE_WIDTH = 640
 TILE_HEIGHT = 480
 BANNER_HEIGHT = 110  # Banner status verifikasi di bawah setiap tile kamera
 
-# Model AI YuNet & SFace
+# Model AI: detector default SCRFD-500M (dimuat di main(), lihat scrfd_detector.py); YuNet di bawah
+# dipakai dengan --detector yunet atau sebagai cadangan jika SCRFD/onnxruntime tidak tersedia.
 detect_model_path = 'face_detection_yunet_2023mar.onnx'
 detect_model_url = 'https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx'
 
@@ -1078,11 +1081,18 @@ def parse_args():
     )
     parser.add_argument('--ruangan', type=str, default=None,
                         help="Hanya pakai kamera di ruangan ini dari dashboard (mis. A6.02). Default: semua kamera aktif")
+    parser.add_argument(
+        '--detector', choices=['scrfd', 'yunet'], default='scrfd',
+        help="Detector wajah:\n"
+             "  'scrfd' : SCRFD-500M via ONNX Runtime (Default). Hasil benchmark lebih akurat saat kepala\n"
+             "            miring, jarak jauh, dan cahaya redup. Kembali ke YuNet jika onnxruntime tidak ada.\n"
+             "  'yunet' : YuNet via OpenCV DNN (CPU)"
+    )
     return parser.parse_args()
 
 
 def main():
-    global CAMERAS, CAMERA_HOSTS, verif_managers, recognizer
+    global CAMERAS, CAMERA_HOSTS, verif_managers, recognizer, face_detector, enroll_detector
     args = parse_args()
     raw_mode = args.mode_opt or args.mode_pos or 'stream'
     mode = 'stream' if raw_mode.lower() in ['s', 'stream'] else 'capture'
@@ -1091,7 +1101,7 @@ def main():
     verif_managers = {name: VerificationManager(name) for name in CAMERA_HOSTS}
     CAMERAS = get_camera_urls(mode)
 
-    # YuNet tetap di OpenCV DNN CPU; SFace dipindah ke ONNX Runtime jika tersedia.
+    # SFace dipindah ke ONNX Runtime jika tersedia.
     ort_recognizer = load_ort_recognizer(args.rec_backend, recognizer)
     if ort_recognizer is not None:
         recognizer = ort_recognizer
@@ -1099,10 +1109,19 @@ def main():
     else:
         rec_label = "OpenCV DNN (CPU)"
 
+    # Detector: SCRFD-500M (default) menggantikan YuNet untuk live & enrollment. Enrollment memakai
+    # ambang skor 0.3, sama seperti benchmark #5 dan enrollment YuNet di atas.
+    det_label = "YuNet OpenCV DNN (CPU)"
+    if args.detector == 'scrfd':
+        scrfd = load_scrfd_detector(use_cuda=True)
+        if scrfd is not None:
+            face_detector, enroll_detector = scrfd, scrfd.with_threshold(0.3)
+            det_label = f"SCRFD-500M ONNX Runtime ({scrfd.provider})"
+
     print("=" * 65)
     print("  SISTEM VERIFIKASI 2-FACTOR (KTM NFC/RFID + FACE RECOGNITION)")
     print(f"  Mode Endpoint: {mode.upper()} ({'/stream (Port 81)' if mode == 'stream' else '/capture (Port 80)'})")
-    print(f"  Runtime AI   : YuNet OpenCV DNN (CPU) | SFace {rec_label}")
+    print(f"  Runtime AI   : {det_label} | SFace {rec_label}")
     print("=" * 65)
 
     # 1. Mulai Webhook Server Tap Kartu
