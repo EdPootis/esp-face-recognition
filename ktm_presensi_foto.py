@@ -5,7 +5,7 @@ Tap KTM langsung dicatat sebagai kehadiran, seperti Presentronik lama. Kamera ha
 dokumentasi: satu foto diambil dari /capture saat kartu di-tap. Tidak ada face recognition, dan
 presensi tetap dicatat walau foto gagal diambil.
 
-Alur per tap (firmware ktm_foto_s3 -> GET /tap?uid=..&cam=..&mac=..):
+Alur per tap (firmware ktm_fr_s3 dengan #define MODE_FOTO -> GET /tap?uid=..&cam=..&mac=..):
   1. Cari pemilik kartu di students_database.json.
   2. Ambil foto JPEG dari http://<ip-kamera>/capture.
   3. Simpan foto di FOTO_DIR (cadangan lokal).
@@ -304,7 +304,9 @@ def post_log(payload):
                  'X-API-Key': DASHBOARD_API_KEY},
         method='POST'
     )
-    with urllib.request.urlopen(req, timeout=5.0) as resp:
+    # 10 detik: request pertama setelah dashboard restart bisa ~4 detik. LCD sudah dibalas sebelum log dikirim,
+    # jadi timeout panjang tidak menahan mahasiswa; timeout terlalu pendek hanya menambah log duplikat.
+    with urllib.request.urlopen(req, timeout=10.0) as resp:
         return resp.getcode()
 
 

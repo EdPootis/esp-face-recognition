@@ -3,7 +3,7 @@
 | | |
 | :--- | :--- |
 | **Penyedia** | Dashboard Presentronik Fasilkom (`POST /api/log/`) |
-| **Pemakai** | `ktm_presensi_foto.py` (repo `esp32cam-face-recognition`), dipasangkan dengan firmware `ktm_foto_s3` |
+| **Pemakai** | `ktm_presensi_foto.py` (repo `esp32cam-face-recognition`), dipasangkan dengan firmware `ktm_fr_s3` yang dikompilasi dengan `#define MODE_FOTO` |
 | **Versi** | 1 — 13 November 2026 |
 | **Kontak** | Edmond Christian (skrip & firmware), Juan Lukius Barnaby (dashboard) |
 
@@ -11,7 +11,7 @@
 
 Mode eksperimen usulan pembimbing. **Tap KTM saja sudah dihitung sebagai kehadiran**, seperti Presentronik lama. Kamera hanya mengambil satu foto saat tap untuk dokumentasi. Tidak ada face recognition, dan presensi tetap dikirim walau foto gagal diambil.
 
-Satu node menjalankan salah satu mode saja: face recognition (`ktm_fr_s3` + `ktm_face_verification*.py`) atau KTM + Foto (`ktm_foto_s3` + `ktm_presensi_foto.py`).
+Satu node menjalankan salah satu mode saja: face recognition (`ktm_fr_s3` + `ktm_face_verification*.py`) atau KTM + Foto (`ktm_fr_s3` dengan `#define MODE_FOTO` + `ktm_presensi_foto.py`). Endpoint firmware kedua mode sama; `MODE_FOTO` hanya mengubah tampilan LCD.
 
 ## 2. Endpoint
 
